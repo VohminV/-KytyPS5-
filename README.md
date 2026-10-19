@@ -415,6 +415,14 @@ To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
 SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
+If the screen flickers, try a different presentation mode:
+
+```bash
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame" --present-mode Fifo
+```
+
+Available values: `Fifo`, `Mailbox` (default) and `Immediate`. `Fifo` synchronizes with vertical blank and usually eliminates flicker, at the cost of a possible FPS cap.
+
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
 

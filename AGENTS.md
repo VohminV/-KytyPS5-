@@ -96,6 +96,11 @@ SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/Exa
 
 First launch: add game folders in global settings. The launcher searches recursively for directories containing `eboot.bin` or ZArchive (`.zar`) dumps whose archive root contains `eboot.bin`.
 
+### Diagnostics / known issues
+
+- Screen flicker: try `--present-mode Fifo` (default is `Mailbox`; also `Immediate`). `Fifo` synchronizes with vertical blank and usually eliminates flicker, possibly capping FPS.
+- `VK_ERROR_OUT_OF_DEVICE_MEMORY` at image creation: VRAM budget exhausted. `CreateImage` in `src/graphics/host_gpu/vma.cpp` now logs the VkResult, image parameters and per-heap memory budget to `stderr` so the cause can be identified instead of silently failing.
+
 ## Testing
 
 ```bash
