@@ -26,6 +26,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+struct ShaderStageRuntime;
 
 class RenderContext {
 public:
@@ -53,6 +54,7 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	void               PrepareBda();
 	void               RunGarbageCollector();
 

@@ -302,6 +302,8 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			return;
 		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+		auto type = SDL_GetGamepadType(pad);
+		LOGF("Controller %d added: type=%d\n", id, static_cast<int>(type));
 		Controller::Connect(id);
 	}
 

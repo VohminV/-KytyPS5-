@@ -38,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1096,6 +1097,56 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+static bool AsyncPipelinesEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_PIPELINES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+static bool DrawOnlyChangesPicture(const DrawRenderState& state,
+                                   std::span<const ShaderVertexInputInfo> vertex_stages) {
+	if (state.depth_info.load_clear_aspects) {
+		return false;
+	}
+	const auto writes_memory = [](const ShaderStageRuntime& stage) {
+		if (stage.program == nullptr) {
+			return true;
+		}
+		const auto& program = *stage.program;
+		if (program.has_address_writes) {
+			return true;
+		}
+		for (const auto& buffer: program.info.buffers) {
+			if (buffer.written || buffer.atomic) {
+				return true;
+			}
+		}
+		for (const auto& image: program.info.images) {
+			if (image.written || image.atomic || image.atomic64) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (const auto& stage: vertex_stages) {
+		if (writes_memory(stage.stage)) {
+			return false;
+		}
+	}
+	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!state.color_info[i].desc.info.IsTiled()) {
+			return false;
+		}
+	}
+	return !static_cast<bool>(state.depth_info.image_id) ||
+	       state.depth_info.desc.info.IsTiled();
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1169,10 +1220,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1189,6 +1236,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
+	auto* pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.programs, feedback_aspects != vk::ImageAspectFlags {},
+	    AsyncPipelinesEnabled() && DrawOnlyChangesPicture(state, vertex_stages));
+	if (pipeline_ptr == nullptr) {
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);

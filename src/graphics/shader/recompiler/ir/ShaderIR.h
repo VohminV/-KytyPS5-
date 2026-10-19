@@ -88,16 +88,26 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		if (typed) return false;
-		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
-		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		// Indirect buffers (GPU-selected V# from a descriptor table) accept any buffer
+		// access opcode. Loads are emitted via LoadIndirectBuffer/LoadIndirectFormattedX;
+		// stores go through EmitBufferAccess which passes IndirectBuffer kind through to
+		// PrepareMemoryResourceAccess.
+		switch (opcode) {
+			case ValueOpcode::ReadConstBuffer:
+			case ValueOpcode::LoadBufferU8:
+			case ValueOpcode::LoadBufferU16:
+			case ValueOpcode::LoadBufferU32:
+			case ValueOpcode::LoadBufferU32x2:
+			case ValueOpcode::LoadBufferU32x3:
+			case ValueOpcode::LoadBufferU32x4:
+			case ValueOpcode::StoreBufferU8:
+			case ValueOpcode::StoreBufferU16:
+			case ValueOpcode::StoreBufferU32:
+			case ValueOpcode::StoreBufferU32x2:
+			case ValueOpcode::StoreBufferU32x3:
+			case ValueOpcode::StoreBufferU32x4: return true;
+			default: return false;
+		}
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -504,6 +514,9 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
+	// User-data registers holding the low dword of a 64-bit base address that DMA (FLAT/global)
+	// accesses offset from; the next register holds the high dword.
+	std::vector<uint32_t>            dma_base_registers;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
@@ -622,7 +635,21 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
+	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader
+	// may update before a read of that slot in program order.
+	std::vector<std::vector<uint32_t>> srt_reads_after_buffer_writes;
+	// The same for each scalar load the shader issues itself, by memory-info index.
+	std::vector<std::vector<uint32_t>> raw_reads_after_buffer_writes;
 };
+
+// Whether a write of the shader to a buffer (an info.buffers index) can be visible to one of
+// its specialization reads. A read that a flattened scalar load made before any write to that
+// buffer in program order is not: the shader consumes the value from the flattened SRT, and
+// each wave performs that load before its own writes, so the dispatch-time snapshot is a value
+// the load observes on hardware.
+bool SpecializationReadFollowsBufferWrite(const CompiledShaderInfo& program,
+                                          const ResourceSnapshot& resources, size_t read,
+                                          uint32_t buffer);
 
 struct UniformFillPlan {
 	UniformFill          fill;
@@ -723,6 +750,9 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
+// raw (optional) receives the same per memory-info index of the shader's own scalar loads.
+std::vector<std::vector<uint32_t>> SrtReadsAfterBufferWrites(
+    const Program& program, std::vector<std::vector<uint32_t>>* raw = nullptr);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);

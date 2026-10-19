@@ -165,6 +165,9 @@ private:
 	void V_CUBESC_F32(const Decoder::Instruction& inst);
 	void V_CUBETC_F32(const Decoder::Instruction& inst);
 	void V_CUBEMA_F32(const Decoder::Instruction& inst);
+	void V_FRACT_F32(const Decoder::Instruction& inst);
+	void V_FRACT_F64(const Decoder::Instruction& inst);
+	void V_FRACT_F16(const Decoder::Instruction& inst);
 	void FloatCube(const Decoder::Instruction& inst, uint32_t result_kind);
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);

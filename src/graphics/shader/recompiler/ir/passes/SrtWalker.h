@@ -18,22 +18,28 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// When set by a read capture, receives the slot of each issued scalar load.
+	uint32_t*                 read_slot                  = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 };
 
 class SrtReadCapture {
 public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges,
+	               std::vector<uint32_t>* slots = nullptr):
+	    m_source(source), m_ranges(ranges), m_slots(slots) {}
 	SrtRuntime ObservedRuntime();
 
 private:
 	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
 	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+	void        Record(uint64_t address, uint64_t size);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	std::vector<uint32_t>*                      m_slots = nullptr;
+	uint32_t                                    m_slot  = NoSrtSlot;
 };
 
 // Retained reads no longer need the guest instruction PC. A clean read evaluates

@@ -62,8 +62,9 @@ bool DdsImage::Load(const std::filesystem::path& path) {
 	allocation.flags =
 	    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 	VmaAllocationInfo mapped {};
-	if (vmaCreateBuffer(m_graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer),
-	                    &allocation, &m_staging, &m_staging_allocation, &mapped) != VK_SUCCESS) {
+	if (vmaCreateBuffer(m_graphics.allocator,
+	                    reinterpret_cast<const VkBufferCreateInfo*>(&buffer), &allocation,
+	                    &m_staging, &m_staging_allocation, &mapped) != VK_SUCCESS) {
 		LOGF("[Splash] could not allocate DDS upload buffer\n");
 		return false;
 	}

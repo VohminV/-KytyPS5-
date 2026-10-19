@@ -858,7 +858,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_dma = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->program->info.uses_dma;
+		if (stage->runtime->program->info.uses_dma) {
+			m_context.CacheDmaBases(*stage->runtime);
+			uses_dma = true;
+		}
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
@@ -924,36 +927,76 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// The image, attachment and buffer ranges the draw writes, collected once for the scalar read
+	// checks below (most bound images are only sampled, and draws rarely write buffers).
+	bool     written_ranges_collected = false;
+	// The span of every written range: most scalar reads (descriptor tables, constants) lie
+	// outside it and need no range checks.
+	uint64_t written_first = UINT64_MAX;
+	uint64_t written_end   = 0;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+		if (!written_ranges_collected) {
+			written_ranges_collected = true;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->program->has_address_writes) {
+					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				}
 			}
-		}
-		for (const auto [address, size]: reads) {
+			m_written_image_ranges.clear();
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						m_written_image_ranges.emplace_back(written.address, written.size);
 					}
 				}
 			}
+			m_written_buffer_ranges.clear();
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
+				for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written.size != 0) {
+						m_written_buffer_ranges.push_back(
+						    {written.address, written.size, writer, index});
 					}
+				}
+			}
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				written_first = std::min(written_first, written_address);
+				written_end   = std::max(written_end, written_address + written_size);
+			}
+			for (const auto& written: m_written_buffer_ranges) {
+				written_first = std::min(written_first, written.address);
+				written_end   = std::max(written_end, written.address + written.size);
+			}
+		}
+		for (size_t read = 0; read < reads.size(); ++read) {
+			const auto [address, size] = reads[read];
+			if (address >= written_end || address + size <= written_first) {
+				continue;
+			}
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+			}
+			for (const auto& written: m_written_buffer_ranges) {
+				// A flattened scalar load issued before the shader's own writes to the buffer may
+				// observe its dispatch-time snapshot on hardware.
+				if (ImageRangeOverlaps(address, size, written.address, written.size) &&
+				    (written.writer != reader ||
+				     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+				         *reader->runtime->program, *reader->runtime->resources, read,
+				         written.resource))) {
+					EXIT("scalar resource reads overlap a shader buffer write\n");
 				}
 			}
 		}

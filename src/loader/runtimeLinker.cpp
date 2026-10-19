@@ -45,6 +45,8 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <execinfo.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -707,6 +709,38 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		{
+			char comm[64] = {};
+			const auto tid = static_cast<long>(syscall(SYS_gettid));
+			char path[64] = {};
+			std::snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", tid);
+			if (FILE* f = std::fopen(path, "r"); f != nullptr) {
+				if (std::fgets(comm, sizeof(comm), f) == nullptr) {
+					comm[0] = '\0';
+				}
+				std::fclose(f);
+			}
+			std::printf("host tid=%ld comm=%s\n", tid, comm);
+			if (FILE* f = std::fopen("/proc/self/maps", "r"); f != nullptr) {
+				char line[512];
+				while (std::fgets(line, sizeof(line), f) != nullptr) {
+					uint64_t lo = 0;
+					uint64_t hi = 0;
+					if (std::sscanf(line, "%" SCNx64 "-%" SCNx64, &lo, &hi) == 2 &&
+					    info->exception_address >= lo && info->exception_address < hi) {
+						std::printf("pc maps: %s", line);
+					}
+				}
+				std::fclose(f);
+			}
+			std::fflush(stdout);
+			void* frames[32] = {};
+			const int depth   = backtrace(frames, 32);
+			std::printf("host backtrace (%d frames):\n", depth);
+			backtrace_symbols_fd(frames, depth, STDOUT_FILENO);
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

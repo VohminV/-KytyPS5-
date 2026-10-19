@@ -155,7 +155,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+	    vmaCreateImage(allocator, reinterpret_cast<const VkImageCreateInfo*>(&image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {

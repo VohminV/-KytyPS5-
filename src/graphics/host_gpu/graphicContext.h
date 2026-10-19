@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 #include <vk_mem_alloc.h>
 
@@ -33,6 +34,7 @@ struct GraphicContext {
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                               attachment_feedback_loop_dynamic_state_enabled = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               supports_block_texel_view              = false;
@@ -116,7 +118,7 @@ struct GraphicContext {
 
 private:
 	mutable std::mutex                                 m_format_properties_mutex;
-	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
+	mutable std::unordered_map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
 	mutable std::map<std::tuple<vk::Format, vk::ImageType, vk::ImageTiling, vk::ImageUsageFlags,
 	                            vk::ImageCreateFlags>,

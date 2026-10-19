@@ -49,10 +49,10 @@ using s64 = int64_t;
 constexpr size_t NearJumpSize = 5;
 
 struct PatchModule {
-	std::mutex           mutex {};
-	u8*                  start = nullptr;
-	u8*                  end   = nullptr;
-	std::set<u8*>        patched;
+	std::mutex             mutex {};
+	u8*                    start = nullptr;
+	u8*                    end   = nullptr;
+	std::unordered_set<u8*> patched;
 	Xbyak::CodeGenerator patch_gen;
 	Xbyak::CodeGenerator trampoline_gen;
 	bool                 trampoline_exhaustion_reported = false;
@@ -120,7 +120,7 @@ struct DecodedCodeInstruction {
 
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
-	std::set<uintptr_t>                         branch_targets;
+	std::unordered_set<uintptr_t>               branch_targets;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};

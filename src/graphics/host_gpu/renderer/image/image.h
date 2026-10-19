@@ -135,6 +135,9 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// Feedback-loop copy: when the host lacks attachment feedback loop support, a copy of this
+	// depth image is maintained for shader sampling instead of sampling the attachment directly.
+	ImageId feedback_copy_id = {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 

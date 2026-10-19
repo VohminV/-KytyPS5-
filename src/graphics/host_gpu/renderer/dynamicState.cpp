@@ -2,6 +2,8 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <vulkan/vulkan.h>
+
 namespace Libs::Graphics {
 
 void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
@@ -133,7 +135,14 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.color_write_enables = false;
 #if !defined(__APPLE__)
 		if (num_color_write_enables != 0) {
-			cmdbuf.setColorWriteEnableEXT(num_color_write_enables, color_write_enables.data());
+			auto pfn = reinterpret_cast<PFN_vkCmdSetColorWriteEnableEXT>(
+			    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(
+			        static_cast<VkDevice>(graphics.device),
+			        "vkCmdSetColorWriteEnableEXT"));
+			if (pfn) {
+				VkCommandBuffer cmdbuf_native = static_cast<VkCommandBuffer>(cmdbuf);
+				pfn(cmdbuf_native, num_color_write_enables, color_write_enables.data());
+			}
 		}
 #endif
 	}
@@ -141,7 +150,8 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.line_width = false;
 		cmdbuf.setLineWidth(line_width);
 	}
-	if (dirty_state.feedback_loop_aspects && graphics.attachment_feedback_loop_enabled) {
+	if (dirty_state.feedback_loop_aspects &&
+	    graphics.attachment_feedback_loop_dynamic_state_enabled) {
 		dirty_state.feedback_loop_aspects = false;
 		cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_aspects);
 	}

@@ -26,7 +26,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -41,7 +43,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+constexpr auto DriverCacheSaveInterval = std::chrono::seconds {30};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -194,6 +196,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	}
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.depth_format));
 	PipelineKeyHash::Mix(hash, static_cast<uint32_t>(key.rendering.stencil_format));
+	PipelineKeyHash::Mix(hash, key.rendering.depth_stencil_feedback_loop ? 1u : 0u);
 	for (const auto id: key.vertex_shader_ids) {
 		PipelineKeyHash::Mix(hash, id);
 	}
@@ -233,9 +236,7 @@ struct PipelineCache::ProgramCache {
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
-		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {}
 
 		std::span<const uint32_t> FunctionCode() const {
 			return call_source
@@ -274,7 +275,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		std::deque<Permutation>                     permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -301,6 +302,9 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		const bool   trace_cs    = options.stage == ShaderType::Compute &&
+		                           std::getenv("KYTY_TRACE_CS") != nullptr;
+		const auto   trace_begin = std::chrono::steady_clock::now();
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -319,6 +323,33 @@ struct PipelineCache::ProgramCache {
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		if (trace_cs) {
+			const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+			                    std::chrono::steady_clock::now() - trace_begin)
+			                    .count();
+			std::fprintf(stderr,
+			             "CS_COMPILE hash=0x%016" PRIx64 " us=%" PRId64 " buffers=%zu images=%zu\n",
+			             options.shader_hash, us, specialization.buffers.size(),
+			             specialization.images.size());
+			for (size_t i = 0; i < specialization.buffers.size(); i++) {
+				const auto& b = specialization.buffers[i];
+				std::fprintf(stderr,
+				             "  b%zu str=%08x fmt=%d sw=%04x zero=%d empty=%d ir=%u imo=%u isi=%u\n",
+				             i, b.packed_stride, static_cast<int>(b.descriptor_format),
+				             b.descriptor_swizzle, b.zero_stride_oob, b.scalar_empty, b.indirect_root,
+				             b.indirect_mapping_offset, b.indirect_search_iterations);
+			}
+			for (size_t i = 0; i < specialization.images.size(); i++) {
+				const auto& im = specialization.images[i];
+				std::fprintf(stderr,
+				             "  i%zu nc=%d dim=%d mip=%u cf=%d sw=%04x ir=%u imo=%u isi=%u cube=%d "
+				             "fmask=%d\n",
+				             i, static_cast<int>(im.numeric_class), static_cast<int>(im.dimension),
+				             im.mip_count, static_cast<int>(im.conversion_format), im.shader_swizzle,
+				             im.indirect_root, im.indirect_mapping_offset, im.indirect_search_iterations,
+				             im.cube, im.fmask);
+			}
 		}
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
@@ -493,9 +524,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_async_thread = std::thread([this] { AsyncPipelineLoop(); });
 }
 
 PipelineCache::~PipelineCache() {
+	m_async_stop.store(true, std::memory_order_relaxed);
+	m_async_cv.notify_all();
+	if (m_async_thread.joinable()) {
+		m_async_thread.join();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -507,9 +544,62 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	destroy(m_async_ready);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
+}
+
+void PipelineCache::AsyncPipelineLoop() {
+	KYTY_PROFILER_THREAD("kyty_pipeline");
+	while (true) {
+		AsyncGraphicsJob job;
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_cv.wait(lock, [this] {
+				return m_async_stop.load(std::memory_order_relaxed) || !m_async_jobs.empty();
+			});
+			if (m_async_jobs.empty()) {
+				return;
+			}
+			job = std::move(m_async_jobs.front());
+			m_async_jobs.pop_front();
+		}
+		for (auto& info: job.vertex_info) {
+			info.stage.resources = &job.resources;
+		}
+		if (job.ps_active) {
+			job.ps_input_info.stage.resources = &job.resources;
+		}
+		auto pipeline = std::make_unique<Pipeline>();
+		{
+			std::lock_guard lock(m_driver_cache_mutex);
+			CreatePipelineInternal(
+			    m_graphics, *pipeline, job.key.rendering, job.key.vertex_input,
+			    std::span {job.vertex_info.data(), job.vertex_count},
+			    job.ps_active ? &job.ps_input_info : nullptr, job.programs, job.key.static_params,
+			    m_driver_cache);
+		}
+		{
+			std::lock_guard lock(m_async_mutex);
+			m_async_pending.erase(job.key);
+			m_async_ready.insert_or_assign(std::move(job.key), std::move(pipeline));
+		}
+	}
+}
+
+PipelineCache::Pipeline*
+PipelineCache::TakeReadyGraphicsPipeline(const GraphicsPipelineKey& key) {
+	std::lock_guard lock(m_async_mutex);
+	auto            ready = m_async_ready.find(key);
+	if (ready == m_async_ready.end()) {
+		return nullptr;
+	}
+	auto* pipeline = ready->second.get();
+	m_graphics_pipelines.insert_or_assign(key, std::move(ready->second));
+	m_async_ready.erase(ready);
+	CheckpointDriverCache();
+	return pipeline;
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -598,6 +688,7 @@ void PipelineCache::CheckpointDriverCache() {
 }
 
 void PipelineCache::Save() {
+	std::lock_guard lock(m_driver_cache_mutex);
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
@@ -810,11 +901,12 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs,
+    bool depth_stencil_feedback_loop, bool allow_async) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -924,6 +1016,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			     depth.desc.info.samples);
 		}
 	}
+	rendering.depth_stencil_feedback_loop = depth_stencil_feedback_loop;
 	if (color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
 		EXIT_IF(!static_cast<bool>(
@@ -983,7 +1076,32 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return iter->second.get();
+	}
+
+	if (auto* ready = TakeReadyGraphicsPipeline(key); ready != nullptr) {
+		return ready;
+	}
+
+	if (allow_async) {
+		std::lock_guard lock(m_async_mutex);
+		if (m_async_pending.insert(key).second) {
+			AsyncGraphicsJob job;
+			job.key          = key;
+			job.vertex_info  = {};
+			job.vertex_count = static_cast<uint32_t>(vertex_info.size());
+			for (uint32_t i = 0; i < job.vertex_count; i++) {
+				job.vertex_info[i] = vertex_info[i];
+			}
+			job.ps_active = ps_active;
+			if (ps_active) {
+				job.ps_input_info = *ps_input_info;
+			}
+			job.programs = programs;
+			m_async_jobs.push_back(std::move(job));
+			m_async_cv.notify_one();
+		}
+		return nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1002,6 +1120,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		std::lock_guard lock(m_driver_cache_mutex);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache);
 	}
@@ -1014,7 +1133,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
 
-	return *iter->second;
+	return iter->second.get();
 }
 
 PipelineCache::Pipeline&
@@ -1038,6 +1157,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		std::lock_guard lock(m_driver_cache_mutex);
 		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
 		                       m_driver_cache);
 	}

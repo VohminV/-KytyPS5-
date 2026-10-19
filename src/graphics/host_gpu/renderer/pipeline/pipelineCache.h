@@ -8,13 +8,19 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -69,6 +75,7 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	bool                                                 depth_stencil_feedback_loop = false;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -133,12 +140,16 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
-	                              const RenderDepthInfo&                 depth,
-	                              std::span<const ShaderVertexInputInfo> vertex_info,
-	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
-	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	                              const RenderDepthInfo&                   depth,
+	                              std::span<const ShaderVertexInputInfo>   vertex_info,
+	                              CommandBuffer&                           command,
+	                              const ShaderPixelInputInfo*              ps_input_info,
+	                              vk::PrimitiveTopology                    topology,
+	                              bool                                     primitive_restart_enable,
+	                              const GraphicsPrograms&                  programs,
+	                              bool                                     depth_stencil_feedback_loop = false,
+	                              bool                                     allow_async                = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -170,6 +181,16 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
+	struct AsyncGraphicsJob {
+		GraphicsPipelineKey                key;
+		std::array<ShaderVertexInputInfo, 3> vertex_info;
+		uint32_t                           vertex_count = 1;
+		bool                               ps_active    = false;
+		ShaderPixelInputInfo               ps_input_info;
+		GraphicsPrograms                   programs;
+		ShaderRecompiler::IR::ResourceSnapshot resources;
+	};
+
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
@@ -180,8 +201,20 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
+	std::mutex                                  m_driver_cache_mutex;
+	std::mutex                                  m_async_mutex;
+	std::condition_variable                     m_async_cv;
+	std::deque<AsyncGraphicsJob>                m_async_jobs;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                            m_async_ready;
+	std::atomic_bool                            m_async_stop {false};
+	std::thread                                 m_async_thread;
+
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void AsyncPipelineLoop();
+	Pipeline* TakeReadyGraphicsPipeline(const GraphicsPipelineKey& key);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

@@ -1,0 +1,166 @@
+{
+	"version": 6,
+	"cmakeMinimumRequired": {
+		"major": 3,
+		"minor": 22,
+		"patch": 1
+	},
+
+	"configurePresets": [
+		{
+			"name": "linux-release",
+			"displayName": "Linux Release (Optimized)",
+			"description": "Optimized Release build for Linux with LTO, lld linker, ccache/sccache, and PCH.",
+			"generator": "Ninja",
+			"binaryDir": "${sourceDir}/_Build/linux",
+			"cacheVariables": {
+				"CMAKE_BUILD_TYPE": "Release",
+				"CMAKE_C_COMPILER": "clang",
+				"CMAKE_CXX_COMPILER": "clang++",
+				"CMAKE_C_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_PREFIX_PATH": "/usr/lib/x86_64-linux-gnu/cmake/Qt6",
+				"CMAKE_BUILD_WITH_INSTALL_RPATH": "ON",
+				"CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+				"KYTY_BUILD_LAUNCHER": "ON",
+				"KYTY_LTO_ENABLED": "ON",
+				"KYTY_PCH_ENABLED": "OFF",
+				"KYTY_BUILD_STATS": "ON",
+				"KYTY_LINK_POOL_SIZE": "4"
+			},
+			"environment": {
+				"CC": "clang",
+				"CXX": "clang++",
+				"CCACHE_DIR": "${sourceDir}/_Build/ccache",
+				"CCACHE_MAXSIZE": "10G",
+				"CCACHE_COMPRESS": "true",
+				"CCACHE_COMPRESSLEVEL": "6",
+				"CCACHE_SLOPPINESS": "file_macro,time_macros",
+				"CCACHE_READONLY": "false",
+				"CCACHE_HARDLINK": "false",
+				"CCACHE_BASEDIR": "${sourceDir}"
+			}
+		},
+		{
+			"name": "linux-release-lto",
+			"displayName": "Linux Release + LTO",
+			"description": "Release build with ThinLTO and lld linker for maximum performance.",
+			"inherits": ["linux-release"],
+			"binaryDir": "${sourceDir}/_Build/linux-lto",
+			"cacheVariables": {
+				"KYTY_LTO_ENABLED": "ON"
+			}
+		},
+		{
+			"name": "linux-debug",
+			"displayName": "Linux Debug",
+			"description": "Debug build without LTO, with debug symbols.",
+			"generator": "Ninja",
+			"binaryDir": "${sourceDir}/_Build/linux-debug",
+			"cacheVariables": {
+				"CMAKE_BUILD_TYPE": "Debug",
+				"CMAKE_C_COMPILER": "clang",
+				"CMAKE_CXX_COMPILER": "clang++",
+				"CMAKE_C_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_PREFIX_PATH": "/usr/lib/x86_64-linux-gnu/cmake/Qt6",
+				"CMAKE_BUILD_WITH_INSTALL_RPATH": "ON",
+				"CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+				"KYTY_BUILD_LAUNCHER": "ON",
+				"KYTY_LTO_ENABLED": "OFF",
+				"KYTY_PCH_ENABLED": "OFF",
+				"KYTY_BUILD_STATS": "OFF",
+				"KYTY_LINK_POOL_SIZE": "2"
+			},
+			"environment": {
+				"CC": "clang",
+				"CXX": "clang++",
+				"CCACHE_DIR": "${sourceDir}/_Build/ccache-debug",
+				"CCACHE_MAXSIZE": "5G"
+			}
+		},
+		{
+			"name": "linux-no-qt",
+			"displayName": "Linux No-Qt (Emulator + Tests)",
+			"description": "Build emulator and tests without Qt launcher.",
+			"generator": "Ninja",
+			"binaryDir": "${sourceDir}/_Build/linux-no-qt",
+			"cacheVariables": {
+				"CMAKE_BUILD_TYPE": "Release",
+				"CMAKE_C_COMPILER": "clang",
+				"CMAKE_CXX_COMPILER": "clang++",
+				"CMAKE_C_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+				"CMAKE_BUILD_WITH_INSTALL_RPATH": "ON",
+				"CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+				"KYTY_BUILD_LAUNCHER": "OFF",
+				"KYTY_LTO_ENABLED": "ON",
+				"KYTY_PCH_ENABLED": "OFF",
+				"KYTY_BUILD_STATS": "ON",
+				"KYTY_LINK_POOL_SIZE": "4"
+			},
+			"environment": {
+				"CC": "clang",
+				"CXX": "clang++",
+				"CCACHE_DIR": "${sourceDir}/_Build/ccache-noqt",
+				"CCACHE_MAXSIZE": "10G"
+			}
+		}
+	],
+
+	"buildPresets": [
+		{
+			"name": "linux-release",
+			"displayName": "Build Linux Release",
+			"description": "Build the Release configuration.",
+			"configurePreset": "linux-release",
+			"targets": ["launcher", "kyty_tests"],
+			"jobs": 0
+		},
+		{
+			"name": "linux-release-lto",
+			"displayName": "Build Linux Release + LTO",
+			"description": "Build the Release + LTO configuration.",
+			"configurePreset": "linux-release-lto",
+			"targets": ["launcher", "kyty_tests"],
+			"jobs": 0
+		},
+		{
+			"name": "linux-debug",
+			"displayName": "Build Linux Debug",
+			"description": "Build the Debug configuration.",
+			"configurePreset": "linux-debug",
+			"targets": ["launcher", "kyty_tests"],
+			"jobs": 0
+		},
+		{
+			"name": "linux-no-qt",
+			"displayName": "Build Linux No-Qt",
+			"description": "Build emulator and tests without Qt.",
+			"configurePreset": "linux-no-qt",
+			"targets": ["kyty_emulator", "kyty_tests"],
+			"jobs": 0
+		},
+		{
+			"name": "kyty-build-report",
+			"displayName": "Build Report",
+			"description": "Show build statistics and cache stats.",
+			"configurePreset": "linux-release",
+			"targets": ["kyty_build_report"],
+			"jobs": 1
+		}
+	],
+
+	"testPresets": [
+		{
+			"name": "linux-release",
+			"displayName": "Test Linux Release",
+			"description": "Run regression tests for Release build.",
+			"configurePreset": "linux-release",
+			"execution": {
+				"workingDirectory": "${sourceDir}/_Build/linux",
+				"outputOnFailure": true
+			}
+		}
+	]
+}

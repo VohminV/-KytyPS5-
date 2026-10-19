@@ -12,6 +12,8 @@ endif()
 
 project(Kyty)
 
+set(PROJECT_VERSION 0.3.0)
+
 find_program(SCCACHE_PROGRAM sccache)
 find_program(CCACHE_PROGRAM ccache)
 
@@ -31,6 +33,11 @@ endforeach()
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KYTY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set(KYTY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
+
+# --- Vulkan: use bundled headers for API consistency, link system lib ---
+find_library(Vulkan_LIBRARY vulkan REQUIRED)
+add_library(Vulkan::Vulkan IMPORTED INTERFACE)
+set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_LOCATION "${Vulkan_LIBRARY}")
 
 if(CMAKE_SYSTEM_NAME MATCHES ".*Linux")
 	set(LINUX TRUE)
@@ -147,7 +154,57 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 0.3.0)
+# --- Linker: prefer lld for fast linking ---
+if(CLANG AND NOT KYTY_CLANG_CL AND NOT DEFINED KYTY_LD_OPTIONS)
+	if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+		find_program(LD_LLD lld)
+		if(LD_LLD)
+			set(KYTY_LD_OPTIONS "-fuse-ld=lld")
+			message(STATUS "Using lld linker for faster linking")
+		endif()
+	endif()
+endif()
+
+# --- Parallel linking (Ninja pools) ---
+if(NOT KYTY_LINK_POOL_SIZE)
+	if(CMAKE_HOST_PROCESSOR_IDENTIFIER MATCHES "x86|X86|AMD64|Intel64")
+		set(KYTY_LINK_POOL_SIZE "4" CACHE STRING "Max parallel link jobs")
+	else()
+		set(KYTY_LINK_POOL_SIZE "2" CACHE STRING "Max parallel link jobs")
+	endif()
+endif()
+
+# --- LTO / IPO support ---
+if(CLANG OR GCC)
+	if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
+		set(KYTY_IPO_SUPPORTED TRUE)
+	else()
+		set(KYTY_IPO_SUPPORTED FALSE)
+	endif()
+else()
+	set(KYTY_IPO_SUPPORTED FALSE)
+endif()
+if(KYTY_IPO_SUPPORTED AND NOT KYTY_ENABLE_CLANG_TIDY)
+	set(KYTY_LTO_ENABLED ON CACHE BOOL "Enable LTO/IPO for Release builds")
+else()
+	set(KYTY_LTO_ENABLED OFF CACHE BOOL "Enable LTO/IPO for Release builds")
+endif()
+
+# --- Build diagnostics ---
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+
+if(NOT DEFINED KYTY_BUILD_STATS)
+	set(KYTY_BUILD_STATS OFF CACHE BOOL "Enable per-target build timing statistics")
+endif()
+
+# --- Precompiled Headers ---
+set(KYTY_PCH_ENABLED OFF CACHE BOOL "Enable precompiled headers for large targets")
+if(KYTY_PCH_ENABLED)
+	set(KYTY_PCH_HEADER "${KYTY_SOURCE_DIR}/common/common.h" CACHE FILEPATH "PCH header file")
+endif()
+
+set(PROJECT_VERSION 0.3.0)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -270,16 +327,19 @@ file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/g
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${shader_name}.comp")
 	set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}.spv")
+	set(shader_depfile "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}.spv.d")
 	set(shader_header "${gpu_tiler_generated_dir}/gpu_tiler_${shader_name}_spv.h")
 	string(TOUPPER "GPU_TILER_${shader_name}_SPV" shader_symbol)
 	add_custom_command(
-		OUTPUT "${shader_header}"
+		OUTPUT "${shader_header}" "${shader_depfile}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -E echo "${shader_spv}: ${shader_source} ${gpu_tiler_shader_includes}" > "${shader_depfile}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
+		DEPFILE "${shader_depfile}"
 		VERBATIM
 	)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
@@ -287,16 +347,19 @@ endforeach()
 
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
+set(fault_buffer_shader_depfile "${gpu_tiler_generated_dir}/fault_buffer_process.spv.d")
 set(fault_buffer_shader_header "${gpu_tiler_generated_dir}/fault_buffer_process_spv.h")
 add_custom_command(
-	OUTPUT "${fault_buffer_shader_header}"
+	OUTPUT "${fault_buffer_shader_header}" "${fault_buffer_shader_depfile}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -E echo "${fault_buffer_shader_spv}: ${fault_buffer_shader_source} ${gpu_tiler_shader_includes}" > "${fault_buffer_shader_depfile}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-	DEPENDS "${fault_buffer_shader_source}"
+	DEPENDS "${fault_buffer_shader_source}" ${gpu_tiler_shader_includes}
+	DEPFILE "${fault_buffer_shader_depfile}"
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
@@ -306,16 +369,19 @@ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 function(add_gpu_blit_shader shader_name shader_file)
 	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
+	set(shader_depfile "${gpu_blit_generated_dir}/${shader_name}.spv.d")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
 	add_custom_command(
-		OUTPUT "${shader_header}"
+		OUTPUT "${shader_header}" "${shader_depfile}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
 		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${ARGN}
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -E echo "${shader_spv}: ${shader_source} ${gpu_tiler_shader_includes}" > "${shader_depfile}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
+		DEPFILE "${shader_depfile}"
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -336,7 +402,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Vulkan Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
 # Linux system libraries.
 if(LINUX)
@@ -579,6 +645,12 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(image_address_layout_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ImageAddressLayoutTests.cpp"
+)
+target_link_libraries(image_address_layout_tests common fmt::fmt)
+target_include_directories(image_address_layout_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -588,15 +660,19 @@ set(gpu_test_ms_depth_spv
 	"${gpu_test_generated_dir}/gpu_test_ms_depth.spv")
 set(gpu_test_ms_depth_header
 	"${gpu_test_generated_dir}/gpu_test_ms_depth_spv.h")
+set(gpu_test_ms_depth_depfile
+	"${gpu_test_generated_dir}/gpu_test_ms_depth.spv.d")
 add_custom_command(
-	OUTPUT "${gpu_test_ms_depth_header}"
+	OUTPUT "${gpu_test_ms_depth_header}" "${gpu_test_ms_depth_depfile}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -o "${gpu_test_ms_depth_spv}" "${gpu_test_ms_depth_source}"
+	COMMAND ${CMAKE_COMMAND} -E echo "${gpu_test_ms_depth_spv}: ${gpu_test_ms_depth_source} ${gpu_tiler_shader_includes}" > "${gpu_test_ms_depth_depfile}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_ms_depth_spv}
 	        -DOUTPUT=${gpu_test_ms_depth_header} -DSYMBOL=GPU_TEST_MS_DEPTH_SPV
 	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-	DEPENDS "${gpu_test_ms_depth_source}"
+	DEPENDS "${gpu_test_ms_depth_source}" ${gpu_tiler_shader_includes}
+	DEPFILE "${gpu_test_ms_depth_depfile}"
 	VERBATIM
 )
 target_sources(shader_recompiler_compute_tests PRIVATE
@@ -629,6 +705,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME image_address_layout COMMAND $<TARGET_FILE:image_address_layout_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -757,6 +834,26 @@ endif()
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
+# --- PCH for kyty_emulator ---
+if(KYTY_PCH_ENABLED AND KYTY_PCH_HEADER)
+	target_precompile_headers(kyty_emulator PRIVATE "${KYTY_PCH_HEADER}")
+endif()
+
+# --- Linker options ---
+if(KYTY_LD_OPTIONS)
+	target_link_options(kyty_emulator PRIVATE ${KYTY_LD_OPTIONS})
+endif()
+
+# --- Ninja link pool (parallel linking) ---
+set_property(TARGET kyty_emulator PROPERTY JOB_POOL_LINK link_pool)
+set_property(GLOBAL PROPERTY JOB_POOLS "link_pool=${KYTY_LINK_POOL_SIZE}")
+
+# --- LTO for Release builds ---
+if(KYTY_LTO_ENABLED AND CMAKE_BUILD_TYPE STREQUAL "Release")
+	target_compile_options(kyty_emulator PRIVATE -flto=thin)
+	target_link_options(kyty_emulator PRIVATE -flto=thin -fuse-ld=lld)
+endif()
+
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
 	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
@@ -843,4 +940,28 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+endif()
+
+# --- Build diagnostics: cache statistics and build report ---
+if(KYTY_BUILD_STATS)
+	add_custom_target(kyty_build_report
+		COMMAND ${CMAKE_COMMAND} -E echo "=== KytyPS5 Build Report ==="
+		COMMAND ${CMAKE_COMMAND} -E echo "Build type: ${CMAKE_BUILD_TYPE}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Linker: ${KYTY_LINKER_ID}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Linker options: ${KYTY_LD_OPTIONS}"
+		COMMAND ${CMAKE_COMMAND} -E echo "LTO enabled: ${KYTY_LTO_ENABLED}"
+		COMMAND ${CMAKE_COMMAND} -E echo "PCH enabled: ${KYTY_PCH_ENABLED}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Vulkan: ${Vulkan_FOUND}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Compiler launcher: ${CMAKE_CXX_COMPILER_LAUNCHER}"
+		COMMAND ${CMAKE_COMMAND} -E echo "Link pool size: ${KYTY_LINK_POOL_SIZE}"
+		COMMAND ${CMAKE_COMMAND} -E echo ""
+		COMMAND ${CMAKE_COMMAND} -E echo "ccache stats (if available):"
+		COMMAND ${CMAKE_COMMAND} -E echo_if_exists ccache -s
+		COMMAND ${CMAKE_COMMAND} -E echo ""
+		COMMAND ${CMAKE_COMMAND} -E echo "sccache stats (if available):"
+		COMMAND ${CMAKE_COMMAND} -E echo_if_exists sccache --show-stats
+		COMMENT "Build configuration report"
+		VERBATIM
+	)
 endif()

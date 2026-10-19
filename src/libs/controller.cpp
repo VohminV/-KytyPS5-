@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/xinput.h"
 #include "kernel/pthread.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
@@ -447,6 +448,16 @@ void Initialize() {
 	}
 	g_keyboard_player = Config::GetKeyboardPlayer();
 	RefreshPlayers();
+
+#ifdef _WIN32
+	// XInput: pre-register Xbox controllers so SDL3 gamepad events also cover them.
+	for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+		XINPUT_STATE state {};
+		if (XInputGetState(i, &state) == ERROR_SUCCESS) {
+			LOGF("XInput: controller %u detected\n", i);
+		}
+	}
+#endif
 }
 
 void Shutdown() {

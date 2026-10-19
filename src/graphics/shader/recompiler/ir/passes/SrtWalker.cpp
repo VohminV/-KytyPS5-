@@ -22,7 +22,17 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
+	if (m_slots != nullptr) {
+		runtime.read_slot = &m_slot;
+	}
 	return runtime;
+}
+
+void SrtReadCapture::Record(uint64_t address, uint64_t size) {
+	m_ranges.emplace_back(address, size);
+	if (m_slots != nullptr) {
+		m_slots->push_back(m_slot);
+	}
 }
 
 bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -30,7 +40,7 @@ bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint
 	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
 		return false;
 	}
-	capture.m_ranges.emplace_back(address, values.size_bytes());
+	capture.Record(address, values.size_bytes());
 	return true;
 }
 
@@ -41,7 +51,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
-	capture.m_ranges.emplace_back(address, values.size_bytes());
+	capture.Record(address, values.size_bytes());
 	return true;
 }
 
@@ -735,17 +745,31 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
+	if (m_runtime.read_slot != nullptr) {
+		// A load shared by several slots has no single slot.
+		const auto roots = std::ranges::count_if(m_program.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		const auto root = std::ranges::find_if(m_program.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		*m_runtime.read_slot = roots == 1   ? root->flat_offset
+		                       : roots == 0 ? RawReadSlot(inst.Flags<SrtReadFlags>().index)
+		                                    : NoSrtSlot;
+	}
+	bool       read   = true;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
+		read = reader(m_runtime.userdata, address, {&word, 1});
 	} else {
 		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
+	if (m_runtime.read_slot != nullptr) {
+		*m_runtime.read_slot = NoSrtSlot;
+	}
 	result = word;
-	return true;
+	return read;
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {

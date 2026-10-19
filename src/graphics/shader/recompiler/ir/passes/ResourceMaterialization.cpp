@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
@@ -19,6 +20,12 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+// Keys an indirect descriptor mapping reserves room for at least.
+constexpr size_t MinIndirectMappingCapacity = 8u;
+// See SetComputeIndirectFloors().
+std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
+std::atomic<size_t> g_compute_indirect_images {1u};
+std::atomic<bool>   g_stable_indirect_layouts {false};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -108,6 +115,47 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
+}
+
+// A descriptor reached through an indirect table can only be bound when its format satisfies the
+// root image's usage; other records in a broad heap must decay to the null image instead of
+// failing the whole specialization.
+bool ImageCandidateUsable(const ImageResource& base, const DescriptorValue& descriptor) {
+	const auto type =
+	    static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
+	const auto format =
+	    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
+	    format > Prospero::BufferFormat::kBc7Srgb ||
+	    DescriptorDimension(descriptor, base.dimension) == Decoder::ImageDimension::Unknown) {
+		return false;
+	}
+	if (base.atomic) {
+		if (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		                  : format != Prospero::BufferFormat::k32UInt &&
+		                        format != Prospero::BufferFormat::k32SInt &&
+		                        format != Prospero::BufferFormat::k32Float) {
+			return false;
+		}
+	}
+	if (Prospero::IsFmaskTextureFormat(format)) {
+		return false;
+	}
+	const bool storage = base.resource_class == ImageResourceClass::Storage;
+	if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
+		return false;
+	}
+	const auto numeric_class =
+	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	if (numeric_class == Prospero::TextureNumericClass::Unsupported) {
+		return false;
+	}
+	if (storage) {
+		const bool raw_sint_storage = RawSignedStorageFormat(base, format) !=
+		                              Prospero::BufferFormat::kInvalid;
+		return raw_sint_storage || numeric_class != Prospero::TextureNumericClass::Sint;
+	}
+	return !base.depth_compare || numeric_class == Prospero::TextureNumericClass::Float;
 }
 
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
@@ -726,7 +774,17 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
-	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
+	// The mapping's offset in the flattened SRT and the number of search steps are part of the
+	// shader permutation, while the number of keys follows guest data from dispatch to dispatch.
+	// Reserve room for a power-of-two number of keys instead: the shader searches the runtime
+	// count, and later mappings keep their offsets until a count crosses a power of two.
+	const bool stable_layout = g_stable_indirect_layouts.load(std::memory_order_relaxed);
+	const auto key_capacity  = !stable_layout ? key_count : std::max<size_t>(
+	    program.stage == ShaderType::Compute
+	        ? g_compute_indirect_keys.load(std::memory_order_relaxed)
+	        : MinIndirectMappingCapacity,
+	    std::bit_ceil(key_count));
+	snapshot.flattened_srt.resize(mapping_offset + 1u + key_capacity * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
 		const auto key = sources.empty() ? keys[entry] : entry;
@@ -757,10 +815,24 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout) {
+			// The same for the distinct T#s: pad them with copies of the last one, which no key
+			// selects, so that with the root they are a power of two (at least 8 for compute).
+			const auto children = descriptors.size() - children_begin;
+			const auto total    = std::max<size_t>(
+			    program.stage == ShaderType::Compute
+			        ? g_compute_indirect_images.load(std::memory_order_relaxed)
+			        : 1u,
+			    std::bit_ceil(children + 1u));
+			for (auto padded = children; padded + 1u < total; ++padded) {
+				descriptors.push_back(descriptors.back());
+				specializations.push_back(specializations.back());
+			}
+		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
 	}
 	return true;
 }
@@ -1475,6 +1547,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+void SetComputeIndirectFloors(size_t keys, size_t images) {
+	g_compute_indirect_keys.store(std::max(std::bit_ceil(keys), MinIndirectMappingCapacity),
+	                              std::memory_order_relaxed);
+	g_compute_indirect_images.store(std::max<size_t>(std::bit_ceil(images), 1u),
+	                                std::memory_order_relaxed);
+	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
@@ -1491,7 +1571,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
+	snapshot.specialization_read_slots.assign(reads.size(), NoSrtSlot);
+	SrtReadCapture capture {runtime, reads, &snapshot.specialization_read_slots};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
@@ -1630,6 +1711,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            !ImageCandidateUsable(image, value) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;

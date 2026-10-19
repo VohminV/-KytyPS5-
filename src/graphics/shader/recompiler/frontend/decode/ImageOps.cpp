@@ -290,14 +290,22 @@ uint32_t CountDmaskComponents(uint32_t dmask) {
 ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t component) {
 	const auto width = [flags](uint32_t index) {
 		if ((flags & ImageSampleFlagA16) == 0u) return 32u;
-		uint32_t cursor = 0;
-		if ((flags & ImageSampleFlagOffset) != 0u) {
-			if (index == cursor++) return 32u;
+		const bool has_offset = (flags & ImageSampleFlagOffset) != 0u;
+		const bool has_bias   = (flags & ImageSampleFlagBias) != 0u;
+		const bool has_compare= (flags & ImageSampleFlagCompare) != 0u;
+		uint32_t named = 0;
+		if (has_offset) {
+			if (index == named) return 32u;
+			++named;
 		}
-		if ((flags & ImageSampleFlagBias) != 0u) {
-			if (index == cursor++) return 16u;
+		if (has_bias) {
+			if (index == named) return 16u;
+			++named;
 		}
-		if ((flags & ImageSampleFlagCompare) != 0u && index == cursor) return 32u;
+		if (has_compare) {
+			if (index == named) return 32u;
+			++named;
+		}
 		return 16u;
 	};
 	uint32_t offset = 0;
@@ -308,7 +316,9 @@ ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, uint32_t compo
 	}
 	const auto bits = width(component);
 	if (bits == 32u) offset = (offset + 31u) & ~31u;
-	return {offset, bits};
+	const auto component_offset = offset;
+	offset += bits;
+	return {component_offset, bits};
 }
 
 uint32_t ImageAddressDwordCount(uint32_t flags, uint32_t components) {
