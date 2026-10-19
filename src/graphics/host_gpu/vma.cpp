@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -69,11 +70,28 @@ void GraphicContext::LogMemoryBudget() const {
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
-		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
-		     ", blocks=%" PRIu64 "\n",
-		     i, static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
+		LOGF("VMA heap %u: size=%" PRIu64 " usage=%" PRIu64 ", budget=%" PRIu64
+		     ", allocation=%" PRIu64 ", blocks=%" PRIu64 "\n",
+		     i, static_cast<uint64_t>(properties.memoryHeaps[i].size),
+		     static_cast<uint64_t>(budgets[i].usage), static_cast<uint64_t>(budgets[i].budget),
 		     static_cast<uint64_t>(budgets[i].statistics.allocationBytes),
 		     static_cast<uint64_t>(budgets[i].statistics.blockBytes));
+	}
+
+	std::fprintf(
+	    stderr,
+	    "[VMA] memory budget (heap count=%u):\n",
+	    properties.memoryHeapCount);
+	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
+		std::fprintf(
+		    stderr,
+		    "[VMA]   heap %u: size=%llu usage=%llu budget=%llu allocation=%llu blocks=%llu\n",
+		    i,
+		    static_cast<unsigned long long>(properties.memoryHeaps[i].size),
+		    static_cast<unsigned long long>(budgets[i].usage),
+		    static_cast<unsigned long long>(budgets[i].budget),
+		    static_cast<unsigned long long>(budgets[i].statistics.allocationBytes),
+		    static_cast<unsigned long long>(budgets[i].statistics.blockBytes));
 	}
 }
 
@@ -153,16 +171,31 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	VmaAllocationInfo allocation_info {};
+	vk::Image::CType  native_image = VK_NULL_HANDLE;
+
+	const auto result = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, reinterpret_cast<const VkImageCreateInfo*>(&image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
+	                   &alloc_info, &native_image, &image.allocation, &allocation_info));
 	if (result != vk::Result::eSuccess) {
+		std::fprintf(
+		    stderr,
+		    "[VMA] vmaCreateImage failed: result=%s (%d), "
+		    "extent=%ux%ux%u, format=%d, type=%d, tiling=%d, "
+		    "usage=0x%x, flags=0x%x, samples=%u, layers=%u, "
+		    "mipLevels=%u, requiredFlags=0x%x\n",
+		    vk::to_string(result).c_str(), static_cast<int>(result), image_info.extent.width,
+		    image_info.extent.height, image_info.extent.depth, static_cast<int>(image_info.format),
+		    static_cast<int>(image_info.imageType), static_cast<int>(image_info.tiling),
+		    static_cast<unsigned int>(image_info.usage),
+		    static_cast<unsigned int>(image_info.flags),
+		    static_cast<unsigned int>(image_info.samples), image_info.arrayLayers,
+		    image_info.mipLevels, alloc_info.requiredFlags);
 		LogMemoryBudget();
 		return false;
 	}
 
+	image.image      = native_image;
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;
@@ -173,6 +206,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
+
+	std::fprintf(stderr,
+	             "[VMA] image created: allocationSize=%llu, memoryType=%u, offset=%llu, "
+	             "extent=%ux%ux%u, format=%d\n",
+	             static_cast<unsigned long long>(allocation_info.size),
+	             allocation_info.memoryType,
+	             static_cast<unsigned long long>(allocation_info.offset),
+	             image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+	             static_cast<int>(image_info.format));
 
 	return true;
 }

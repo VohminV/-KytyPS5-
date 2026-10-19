@@ -678,8 +678,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		const auto self            = Libs::LibKernel::PthreadSelfOrNull();
+		char       thread_name[64] = "(host thread)";
+		if (self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 			}
@@ -735,10 +736,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::fclose(f);
 			}
 			std::fflush(stdout);
-			void* frames[32] = {};
-			const int depth   = backtrace(frames, 32);
-			std::printf("host backtrace (%d frames):\n", depth);
-			backtrace_symbols_fd(frames, depth, STDOUT_FILENO);
+			// Unwinding a guest thread's stack walks foreign frames and can fault again.
+			if (self == nullptr) {
+				void*     frames[32] = {};
+				const int depth      = backtrace(frames, 32);
+				std::printf("host backtrace (%d frames):\n", depth);
+				backtrace_symbols_fd(frames, depth, STDOUT_FILENO);
+			}
 		}
 #endif
 		std::fflush(stdout);
