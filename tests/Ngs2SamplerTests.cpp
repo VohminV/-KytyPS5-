@@ -47,6 +47,7 @@ struct Fixture {
 		} else {
 			rack.option.custom_sampler.max_waveform_blocks = capacity;
 			rack.option.custom_sampler.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
+			rack.option.custom_sampler.custom_rack_option.num_buffers = 1;
 		}
 	}
 
@@ -701,6 +702,53 @@ void TestSubmixerSetupAndRouting() {
 		          mastering.samples[1] == -expected,
 		      "submixer lost routed samples across render grains");
 	}
+}
+
+uint32_t g_side_chain_flags = 0;
+
+void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
+	Check(context->num_channels == 1 && context->grain_samples == 1 &&
+	          context->user_data[0] == 7,
+	      "user FX context did not describe the custom voice");
+	g_side_chain_flags = context->flags;
+	context->channels[0][0] *= context->channels[1][0];
+}
+
+void TestCustomSideChainUserFx() {
+	Fixture          main(48000), side(48000);
+	Ngs2RackInternal custom_rack {};
+	auto&            custom = custom_rack.option.custom_submixer.custom_rack_option;
+	custom_rack.ngs         = &main.system;
+	custom_rack.type        = Ngs2RackType::CustomSubmixer;
+	custom.num_buffers      = 2;
+	custom.num_modules      = 1;
+	custom.module[0]        = {nullptr, 0x19, 0, 1, 0};
+	Ngs2VoiceInternal voice;
+	voice.rack = &custom_rack;
+	voice.ports.resize(1);
+	voice.modules.resize(1);
+	struct {
+		Ngs2VoiceParamHeader header {24, 0, 0x40020000};
+		uint32_t             inputs = 1, outputs = 1, flags = 0, reserved = 0;
+	} setup;
+	struct {
+		Ngs2VoiceParamHeader header;
+		void                 KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*);
+		uintptr_t            user_data[3];
+	} fx {{40, 0, 0x40001900}, MultiplyBySideChain, {7, 0, 0}};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK &&
+	          Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &fx.header) == OK,
+	      "custom submixer user FX setup failed");
+	voice.state = Ngs2VoicePlayState::Playing;
+	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
+	side.voice.ports.push_back({&voice, 1, 1.0f, -1});
+	const int16_t main_pcm = 8192, side_pcm = 16384;
+	main.Queue(&main_pcm, 1, 0);
+	side.Queue(&side_pcm, 1, 0);
+	Ngs2RenderVoice(voice, {&main.voice, &side.voice, &voice}, 1);
+	Check(voice.has_samples && voice.samples[0] == 0.125f && voice.samples[1] == 0.5f &&
+	          g_side_chain_flags == 1,
+	      "user FX did not receive the side-chain buffer after the source channels");
 }
 
 void TestPcm16RenderOutput() {
@@ -1608,6 +1656,7 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
+	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
 	TestAtrac9ResampleAfterStarvation();
 	TestAtrac9ResampleAcrossFrames();
