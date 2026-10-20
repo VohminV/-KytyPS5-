@@ -52,6 +52,7 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
 struct Fixture {
   Program program;
   Block *block = nullptr;
+  ShaderComputeInputInfo compute_info{};
 
   explicit Fixture(ShaderType stage = ShaderType::Compute) {
     program.stage = stage;
@@ -131,7 +132,9 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input = {}) {
+  void PlanAndTrack() { PlanAndTrack({.compute = &compute_info}); }
+
+  void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input) {
     for (size_t index = 0; index < program.blocks.size(); ++index) {
       const auto condition = program.blocks[index]->condition;
       if (!condition.IsEmpty())

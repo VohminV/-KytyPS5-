@@ -169,10 +169,10 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	if (const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		return workgroup->lds_size_dwords;
 	}
-	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr) {
+	if (state.program.stage == ShaderType::Pixel) {
 		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
 	}
-	if (state.program.stage == ShaderType::Vertex && state.input_info.vertex != nullptr) {
+	if (state.program.stage == ShaderType::Vertex) {
 		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
 	}
 	return FUNCTION_LDS_DWORDS;

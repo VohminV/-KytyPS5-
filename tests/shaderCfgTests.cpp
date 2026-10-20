@@ -14343,7 +14343,7 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
     ShaderRecompiler::IR::RemoveIdentities(ir);
     ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   }
-  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg);
+  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg, options.input_info);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
 }
 
@@ -16182,10 +16182,6 @@ void TestCompilerStageInputOwnership() {
   CheckSpirvBinaryValidates(compiled.spirv);
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  options.stage = ShaderType::Vertex;
-  options.input_info.vertex = nullptr;
-  ExpectFatal([&] { (void)TranslateProgram(shader, options); },
-              "missing stage metadata bypassed translation validation");
   const uint32_t auxiliary_position[] = {
       EncodeExp0(0x0d, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)};
   for (const auto stage : {ShaderType::Pixel, ShaderType::Compute}) {

@@ -80,7 +80,7 @@ struct EmitterState {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
 		if (program.info.uses_lds && program.stage == ShaderType::Compute &&
-		    input_info.compute != nullptr && input_info.compute->lds_storage) {
+		    input_info.compute->lds_storage) {
 			lds_storage_class = spv::StorageClassStorageBuffer;
 		}
 	}
