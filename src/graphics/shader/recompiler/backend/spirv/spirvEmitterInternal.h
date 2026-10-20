@@ -510,8 +510,6 @@ inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Typ
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
-
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);
 
