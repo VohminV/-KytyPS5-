@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/low_vram_downscale.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -50,6 +51,8 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+
+	LowVramDownscale::Init(allocator);
 	return true;
 }
 
@@ -172,22 +175,55 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	VmaAllocationInfo allocation_info {};
-	vk::Image::CType  native_image = VK_NULL_HANDLE;
+	VkImage           native_image = VK_NULL_HANDLE;
 
-	const auto result = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, reinterpret_cast<const VkImageCreateInfo*>(&image_info),
-	                   &alloc_info, &native_image, &image.allocation, &allocation_info));
-	if (result != vk::Result::eSuccess) {
+	const auto* original_create_info =
+	    reinterpret_cast<const VkImageCreateInfo*>(&image_info);
+	VkImageCreateInfo create_info = *original_create_info;
+	LowVramDownscale::Apply(create_info);
+
+	const auto try_create = [&](VkImageCreateInfo& info) {
+		image.allocation = nullptr;
+		native_image     = VK_NULL_HANDLE;
+		return vmaCreateImage(allocator, &info, &alloc_info, &native_image, &image.allocation,
+		                      &allocation_info);
+	};
+
+	VkResult result = try_create(create_info);
+
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+	    LowVramDownscale::GetConfig().call_gc_on_oom) {
+		LowVramDownscale::RunGcCallback();
+		result = try_create(create_info);
+	}
+
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+		VkImageCreateInfo emergency_info = *original_create_info;
+		LowVramDownscale::ApplyEmergency(emergency_info);
+
+		if (emergency_info.extent.width != original_create_info->extent.width ||
+		    emergency_info.extent.height != original_create_info->extent.height) {
+			std::fprintf(stderr, "[low-vram-downscale] OOM fallback: %ux%u -> %ux%u\n",
+			             original_create_info->extent.width,
+			             original_create_info->extent.height,
+			             emergency_info.extent.width, emergency_info.extent.height);
+			create_info = emergency_info;
+			result      = try_create(create_info);
+		}
+	}
+
+	if (result != VK_SUCCESS) {
+		const auto vk_result = static_cast<vk::Result>(result);
 		std::fprintf(
 		    stderr,
 		    "[VMA] vmaCreateImage failed: result=%s (%d), "
 		    "extent=%ux%ux%u, format=%d, type=%d, tiling=%d, "
 		    "usage=0x%x, flags=0x%x, samples=%u, layers=%u, "
 		    "mipLevels=%u, requiredFlags=0x%x\n",
-		    vk::to_string(result).c_str(), static_cast<int>(result), image_info.extent.width,
-		    image_info.extent.height, image_info.extent.depth, static_cast<int>(image_info.format),
-		    static_cast<int>(image_info.imageType), static_cast<int>(image_info.tiling),
-		    static_cast<unsigned int>(image_info.usage),
+		    vk::to_string(vk_result).c_str(), static_cast<int>(vk_result),
+		    image_info.extent.width, image_info.extent.height, image_info.extent.depth,
+		    static_cast<int>(image_info.format), static_cast<int>(image_info.imageType),
+		    static_cast<int>(image_info.tiling), static_cast<unsigned int>(image_info.usage),
 		    static_cast<unsigned int>(image_info.flags),
 		    static_cast<unsigned int>(image_info.samples), image_info.arrayLayers,
 		    image_info.mipLevels, alloc_info.requiredFlags);
@@ -196,25 +232,30 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	}
 
 	image.image      = native_image;
-	image.format     = image_info.format;
-	image.image_type = image_info.imageType;
-	image.extent     = image_info.extent;
-	image.layers     = image_info.arrayLayers;
-	image.mip_levels = image_info.mipLevels;
-	image.samples    = static_cast<uint32_t>(image_info.samples);
-	image.usage      = image_info.usage;
-	image.flags      = image_info.flags;
-	image.state      = {.layout = image_info.initialLayout};
+	image.format     = static_cast<vk::Format>(create_info.format);
+	image.image_type = static_cast<vk::ImageType>(create_info.imageType);
+	image.extent     = vk::Extent3D {create_info.extent.width, create_info.extent.height,
+	                                 create_info.extent.depth};
+	image.layers     = create_info.arrayLayers;
+	image.mip_levels = create_info.mipLevels;
+	image.samples    = static_cast<uint32_t>(create_info.samples);
+	image.usage      = static_cast<vk::ImageUsageFlags>(create_info.usage);
+	image.flags      = static_cast<vk::ImageCreateFlags>(create_info.flags);
+	image.state      = {.layout = static_cast<vk::ImageLayout>(create_info.initialLayout)};
 	image.subresource_states.clear();
 
-	std::fprintf(stderr,
-	             "[VMA] image created: allocationSize=%llu, memoryType=%u, offset=%llu, "
-	             "extent=%ux%ux%u, format=%d\n",
-	             static_cast<unsigned long long>(allocation_info.size),
-	             allocation_info.memoryType,
-	             static_cast<unsigned long long>(allocation_info.offset),
-	             image_info.extent.width, image_info.extent.height, image_info.extent.depth,
-	             static_cast<int>(image_info.format));
+	std::fprintf(
+	    stderr,
+	    "[VMA] image created: allocationSize=%llu, memoryType=%u, offset=%llu, "
+	    "extent=%ux%ux%u, format=%d, usage=0x%08X%s\n",
+	    static_cast<unsigned long long>(allocation_info.size), allocation_info.memoryType,
+	    static_cast<unsigned long long>(allocation_info.offset), create_info.extent.width,
+	    create_info.extent.height, create_info.extent.depth, static_cast<int>(create_info.format),
+	    static_cast<unsigned>(create_info.usage),
+	    (create_info.extent.width != image_info.extent.width ||
+	     create_info.extent.height != image_info.extent.height)
+	        ? " (downscaled)"
+	        : "");
 
 	return true;
 }

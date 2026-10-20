@@ -47,8 +47,8 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
-	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
-	::printf("  --screen-height <num>                Window height. Default: 720.\n");
+	::printf("  --screen-width <num>                 Window width. Default: 1920.\n");
+	::printf("  --screen-height <num>                Window height. Default: 1080.\n");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
