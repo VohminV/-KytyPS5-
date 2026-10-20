@@ -230,8 +230,11 @@ enum class TessellationAttribute {
 	ControlOutput,
 	EvaluationInput,
 	PatchOutput,
+	PatchInput,
 	Factor
 };
+constexpr uint32_t NumTessellationAttributes =
+    static_cast<uint32_t>(TessellationAttribute::Factor) + 1u;
 
 enum class StageInputKind {
 	VertexIndex,
