@@ -285,7 +285,6 @@ struct ImageSampleLayout {
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };

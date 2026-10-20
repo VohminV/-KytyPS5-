@@ -17,12 +17,9 @@ uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t va
 }
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
-	F32Class cls;
-	cls.bits            = bits;
-	const auto abs_bits = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-	cls.nan  = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u);
-	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
-	return cls;
+	const auto abs_bits = EmitAndConstant(state, bits, 0x7fffffffu);
+	return {EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u),
+	        EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0)};
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
