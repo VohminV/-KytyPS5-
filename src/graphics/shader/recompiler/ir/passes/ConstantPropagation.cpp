@@ -651,10 +651,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		}
-		case ValueOpcode::BitCount32: {
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindILsb32: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U32()))));
+				const auto bits = value.U32();
+				Replace(inst, Value(static_cast<uint32_t>(
+				    inst.GetOpcode() == ValueOpcode::BitCount32 ? std::popcount(bits)
+				    : bits == 0u                                ? -1
+				                                                : std::countr_zero(bits))));
 			}
 			return;
 		}
@@ -667,7 +672,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::UMin32:
-			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); });
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); })) {
+				ReplaceBinaryIdentity(inst, Type::U32, ~0u);
+			}
 			return;
 		case ValueOpcode::UMax32:
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });

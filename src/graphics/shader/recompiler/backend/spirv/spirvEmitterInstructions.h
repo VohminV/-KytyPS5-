@@ -92,7 +92,6 @@ EMIT_NATIVE(BitReverse32, OpBitReverse, U32, uint32_t)
 EMIT_NATIVE(BitCount32, OpBitCount, U32, uint32_t)
 inline constexpr auto EmitFindILsb32 = EmitGlsl<GLSLstd450FindILsb, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitFindUMsb32 = EmitGlsl<GLSLstd450FindUMsb, IR::Type::U32, uint32_t>;
-uint32_t EmitFindUMsb64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitSMin32 = EmitGlsl<GLSLstd450SMin, IR::Type::U32, uint32_t, uint32_t>;
 inline constexpr auto EmitSMax32 = EmitGlsl<GLSLstd450SMax, IR::Type::U32, uint32_t, uint32_t>;
 inline constexpr auto EmitUMin32 = EmitGlsl<GLSLstd450UMin, IR::Type::U32, uint32_t, uint32_t>;

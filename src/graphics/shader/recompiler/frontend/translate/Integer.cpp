@@ -221,19 +221,21 @@ void Translator::V_XOR3_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero) {
+void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb) {
 	auto source = ReadU32Pair(inst.src0);
-	if (find_zero) {
-		source[0] = ir.BitwiseNot(source[0]);
-		source[1] = ir.BitwiseNot(source[1]);
+	for (auto& word: source) {
+		word = find_zero ? ir.BitwiseNot(word) : word;
 	}
-	const auto low_lsb       = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]}));
-	const auto high_lsb      = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]}));
-	const auto high_position = ir.IAdd(high_lsb, IR::U32(IR::Value(32u)));
-	const auto result        = ir.Select(ir.INotEqual(source[0], IR::U32(IR::Value(0u))), low_lsb,
-	                                     ir.Select(ir.INotEqual(source[1], IR::U32(IR::Value(0u))),
-	                                               high_position, IR::U32(IR::Value(0xffffffffu))));
-	WriteOperand(DestinationOperand(inst), result);
+	if (from_msb) {
+		// The leading bit index is the trailing bit index of the bit-reversed 64-bit value.
+		source = {IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {source[1]})),
+		          IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {source[0]}))};
+	}
+	// FindILsb returns ~0 for zero, so OR-ing 32 keeps a missing high bit at ~0 (-1).
+	const auto low  = ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]});
+	const auto high = ir.BitwiseOr(IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]})),
+	                               IR::U32(IR::Value(32u)));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::UMin32, {low, high}));
 }
 
 void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
@@ -245,17 +247,6 @@ void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
 	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
 	                                IR::U32(IR::Value(0xffffffffu)));
-	WriteOperand(DestinationOperand(inst), result);
-}
-
-void Translator::S_FLBIT_I32_B64(const Decoder::Instruction& inst) {
-	const auto source   = ReadU64(inst.src0);
-	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb64, {source}));
-	const auto position = ir.ISub(IR::U32(IR::Value(63u)), msb);
-	const auto nonzero =
-	    IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64,
-	                   {source, ir.ConstructU64(IR::U32(IR::Value(0u)), IR::U32(IR::Value(0u)))}));
-	const auto result = ir.Select(nonzero, position, IR::U32(IR::Value(0xffffffffu)));
 	WriteOperand(DestinationOperand(inst), result);
 }
 

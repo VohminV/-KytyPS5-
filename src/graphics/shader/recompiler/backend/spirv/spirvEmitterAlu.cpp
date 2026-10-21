@@ -5,18 +5,6 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-struct Pair {
-	uint32_t low  = 0;
-	uint32_t high = 0;
-};
-
-Pair ExtractPair(EmitterState& state, uint32_t value) {
-	Pair result {state.builder.AllocateId(), state.builder.AllocateId()};
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.low, value, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.high, value, 1);
-	return result;
-}
-
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
@@ -158,18 +146,6 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
 	// return EmitFlushF32DenormToSignedZero(state, sum);
 	return sum;
-}
-
-uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {
-	// GLSL FindUMsb is restricted to 32-bit components.
-	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), value);
-	const auto pair =
-	    ExtractPair(state, EmitExt(state, TypeU32Vector(state, 2), GLSLstd450FindUMsb, {unpacked}));
-	const auto high_found =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), pair.high, ConstantU32(state, UINT32_MAX));
-	return Select(state, TypeU32(state), high_found,
-	              Binary(state, spv::OpIAdd, TypeU32(state), pair.high, ConstantU32(state, 32)),
-	              pair.low);
 }
 
 uint32_t EmitConvertU16U32(EmitterState& state, uint32_t arg0) {
