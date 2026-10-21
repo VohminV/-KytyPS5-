@@ -954,9 +954,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& resource = program.info.buffers[index];
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0) {
+					// ADD_TID and swizzle move fixed-offset writes past write_extent.
+					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+					const auto written_size =
+					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
+					if (written_size != 0) {
 						m_written_buffer_ranges.push_back(
-						    {written.address, written.size, writer, index});
+						    {written.address, written_size, writer, index});
 					}
 				}
 			}
