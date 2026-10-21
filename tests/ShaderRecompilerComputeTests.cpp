@@ -25178,10 +25178,8 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
-  test.ir_counts = {{" = BitwiseAnd32 ", 2},
-                    {" = ShiftLeftLogical32 ", 1},
-                    {" = BitwiseOr32 ", 1}};
-  test.required_spirv = {"OpBitwiseAnd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.ir_counts = {{" = BitFieldInsert ", 1}};
+  test.required_spirv = {"OpBitFieldInsert"};
   return test;
 }
 
