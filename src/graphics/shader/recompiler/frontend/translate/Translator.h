@@ -113,11 +113,6 @@ private:
 	void DS_ORDERED_COUNT(const Decoder::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
-	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
-	                                 uint32_t high_result);
-	IR::U32 ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, float upper_bound,
-	                                 float safe_upper, uint32_t lower_result,
-	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);

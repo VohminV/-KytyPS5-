@@ -6,38 +6,6 @@ IR::F32 Translator::SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 fals
 	return IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {condition, true_value, false_value}));
 }
 
-IR::U32 Translator::ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
-                                             uint32_t upper_result) {
-	const auto zero = IR::F32(IR::Value::F32(0.0f));
-	const auto nan  = IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
-	const auto low  = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThanEqual32, {value, zero}));
-	const auto high = IR::U1(
-	    ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual32, {value, IR::Value::F32(upper_bound)}));
-	const auto truncated = IR::F32(ir.Emit(IR::ValueOpcode::FPTrunc32, {value}));
-	const auto safe_low  = SelectF32(ir.LogicalOr(nan, low), zero, truncated);
-	const auto safe      = SelectF32(high, IR::F32(IR::Value::F32(safe_upper)), safe_low);
-	const auto converted = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32F32, {safe}));
-	return ir.Select(high, IR::U32(IR::Value(upper_result)), converted);
-}
-
-IR::U32 Translator::ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, float upper_bound,
-                                             float safe_upper, uint32_t lower_result,
-                                             uint32_t upper_result) {
-	const auto nan = IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
-	const auto low = IR::U1(
-	    ir.Emit(IR::ValueOpcode::FPOrdLessThanEqual32, {value, IR::Value::F32(lower_bound)}));
-	const auto high = IR::U1(
-	    ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual32, {value, IR::Value::F32(upper_bound)}));
-	const auto truncated    = IR::F32(ir.Emit(IR::ValueOpcode::FPTrunc32, {value}));
-	const auto safe_low     = SelectF32(low, IR::F32(IR::Value::F32(lower_bound)), truncated);
-	const auto safe_high    = SelectF32(high, IR::F32(IR::Value::F32(safe_upper)), safe_low);
-	const auto safe         = SelectF32(nan, IR::F32(IR::Value::F32(0.0f)), safe_high);
-	const auto converted    = IR::U32(ir.Emit(IR::ValueOpcode::ConvertS32F32, {safe}));
-	const auto clamped_high = ir.Select(high, IR::U32(IR::Value(upper_result)), converted);
-	const auto clamped      = ir.Select(low, IR::U32(IR::Value(lower_result)), clamped_high);
-	return ir.Select(nan, IR::U32(IR::Value(0u)), clamped);
-}
-
 void Translator::V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index) {
 	const auto source = ReadU32(SourceAt(inst, 0));
 	const auto byte =
@@ -58,15 +26,12 @@ void Translator::V_CVT_F32_I32(const Decoder::Instruction& inst) {
 
 void Translator::V_CVT_U32_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToU32Saturated(value, 4294967296.0f, 4294967040.0f, 0xffffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertU32F32, {value}));
 }
 
 void Translator::V_CVT_I32_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(value, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {value}));
 }
 
 void Translator::V_CVT_F16_F32(const Decoder::Instruction& inst) {
@@ -86,31 +51,30 @@ void Translator::V_CVT_F16_16(const Decoder::Instruction& inst, bool signed_valu
 
 void Translator::V_CVT_16_F16(const Decoder::Instruction& inst, bool signed_value) {
 	const auto value = ReadF16AsF32(inst.src0);
+	// The 32-bit conversion already saturates and maps NaN to zero.
 	if (signed_value) {
-		const auto converted =
-		    ConvertF32ToI32Saturated(value, -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
-		Write16Bits(DestinationOperand(inst), converted);
+		const auto converted = ir.Emit(IR::ValueOpcode::ConvertS32F32, {value});
+		const auto low = ir.Emit(IR::ValueOpcode::SMax32, {converted, IR::Value(0xffff8000u)});
+		Write16Bits(DestinationOperand(inst),
+		            IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)})));
 		return;
 	}
+	const auto converted = ir.Emit(IR::ValueOpcode::ConvertU32F32, {value});
 	Write16Bits(DestinationOperand(inst),
-	         ConvertF32ToU32Saturated(value, 65536.0f, 65535.0f, 0xffffu));
+	            IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {converted, IR::Value(0xffffu)})));
 }
 
 void Translator::V_CVT_RPI_I32_F32(const Decoder::Instruction& inst) {
 	const auto source  = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
 	const auto biased  = IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {source, IR::Value::F32(0.5f)}));
 	const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {biased}));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(rounded, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {rounded}));
 }
 
 void Translator::V_CVT_FLR_I32_F32(const Decoder::Instruction& inst) {
 	const auto source  = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
 	const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {source}));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(rounded, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {rounded}));
 }
 
 void Translator::V_FREXP_EXP_I32_F32(const Decoder::Instruction& inst) {
@@ -157,7 +121,9 @@ void Translator::V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpc
 
 void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 	const auto source = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
-	const auto byte   = ConvertF32ToU32Saturated(source, 255.0f, 255.0f, 255u);
+	const auto byte =
+	    IR::U32(ir.Emit(IR::ValueOpcode::UMin32,
+		                {ir.Emit(IR::ValueOpcode::ConvertU32F32, {source}), IR::Value(255u)}));
 	const auto index  = ir.BitwiseAnd(ReadU32(SourceAt(inst, 1)), IR::U32(IR::Value(3u)));
 	const auto shift  = ir.ShiftLeftLogical(index, IR::U32(IR::Value(3u)));
 	const auto mask   = ir.ShiftLeftLogical(IR::U32(IR::Value(0xffu)), shift);

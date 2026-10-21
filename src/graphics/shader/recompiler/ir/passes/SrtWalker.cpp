@@ -861,12 +861,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::ConvertU32F32:
 			if (Arg(inst, 0, a)) {
+				// The conversion saturates and maps NaN to zero.
 				const auto value = Float32(a);
-				if (!std::isfinite(value) || value < 0.0f ||
-				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
-				}
-				result = static_cast<uint32_t>(value);
+				result           = std::isnan(value) || value <= 0.0f ? 0u
+				                   : value >= 4294967296.0f ? UINT32_MAX
+				                                            : static_cast<uint32_t>(value);
 				return true;
 			}
 			return false;
