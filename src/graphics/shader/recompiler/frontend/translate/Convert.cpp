@@ -125,9 +125,9 @@ void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 		                {ir.Emit(IR::ValueOpcode::ConvertU32F32, {source}), IR::Value(255u)}));
 	const auto index  = ir.BitwiseAnd(ReadU32(SourceAt(inst, 1)), IR::U32(IR::Value(3u)));
 	const auto shift  = ir.ShiftLeftLogical(index, IR::U32(IR::Value(3u)));
-	const auto mask   = ir.ShiftLeftLogical(IR::U32(IR::Value(0xffu)), shift);
-	const auto base   = ir.BitwiseAnd(ReadU32(SourceAt(inst, 2)), ir.BitwiseNot(mask));
-	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(base, ir.ShiftLeftLogical(byte, shift)));
+	WriteOperand(DestinationOperand(inst),
+	             ir.Emit(IR::ValueOpcode::BitFieldInsert,
+	                     {ReadU32(SourceAt(inst, 2)), byte, shift, IR::Value(8u)}));
 }
 
 void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
