@@ -148,7 +148,6 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
-		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
@@ -269,9 +268,7 @@ private:
 			}
 			return finish(Validate(inst->Arg(1)));
 		}
-		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
-		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
-		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
+		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 || op == ValueOpcode::Void) {
 			return finish(false);
 		}
 		if (op == ValueOpcode::GetUserData) {
@@ -856,12 +853,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::IMul64:
-			if (binary()) {
-				result = a * b;
-				return true;
-			}
-			return false;
 		case ValueOpcode::UMulHi:
 			if (binary()) {
 				result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
@@ -1167,10 +1158,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU8:
-		case ValueOpcode::UndefU16:
-		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
+		case ValueOpcode::UndefU32: return false;
 		default: break;
 	}
 	return false;

@@ -255,14 +255,6 @@ uint32_t EmitUMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMulHigh(state, arg0, arg1, false);
 }
 
-uint32_t EmitBitCount64(EmitterState& state, uint32_t arg0) {
-	// Vulkan bit-count operands remain 32-bit, including when counting a U64.
-	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0);
-	const auto pair =
-	    ExtractPair(state, Unary(state, spv::OpBitCount, TypeU32Vector(state, 2), unpacked));
-	return Binary(state, spv::OpIAdd, TypeU32(state), pair.low, pair.high);
-}
-
 uint32_t EmitSMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
 	return EmitSMin32(state, arg0, EmitSMin32(state, arg1, arg2));
 }

@@ -277,7 +277,7 @@ void Translator::Integer24(const Decoder::Instruction& inst, bool sign, bool add
 void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	const auto lhs = ReadU32(inst.src0);
 	const auto rhs = ReadU32(inst.src1);
-	// Keep the 32x32 product in words: native widening IMul64 fails NVIDIA compilation
+	// Keep the 32x32 product in words: a native widening 64-bit multiply fails NVIDIA compilation
 	// in large vertex shaders (Astro's Playroom). The 64-bit addition stays native.
 	const auto product = ir.ConstructU64(
 	    ir.IMul(lhs, rhs), IR::U32(ir.Emit(IR::ValueOpcode::UMulHi, {lhs, rhs})));

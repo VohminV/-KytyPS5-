@@ -511,11 +511,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				ReplaceBinaryIdentity(inst, Type::U32, 1u);
 			}
 			return;
-		case ValueOpcode::IMul64:
-			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a * b; })) {
-				ReplaceBinaryIdentity(inst, Type::U64, 1u);
-			}
-			return;
 		case ValueOpcode::WqmU64: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U64)) {
@@ -671,13 +666,6 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U32)) {
 				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U32()))));
-			}
-			return;
-		}
-		case ValueOpcode::BitCount64: {
-			const auto value = Arg(inst, 0);
-			if (IsImmediate(value, Type::U64)) {
-				Replace(inst, Value(static_cast<uint32_t>(std::popcount(value.U64()))));
 			}
 			return;
 		}
