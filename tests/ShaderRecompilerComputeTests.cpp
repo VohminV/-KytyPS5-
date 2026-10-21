@@ -1313,6 +1313,9 @@ struct BdaMapping {
   u32 backing_offset = 0;
 };
 
+using ShaderProfile = ShaderRecompiler::Spirv::Profile;
+constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1340,6 +1343,7 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1672,7 +1676,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.maintenance8_enabled = true;
+  options.profile = test.profile;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
@@ -1745,7 +1749,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, options.maintenance8_enabled);
+        result.program, options.input_info, 0u, *options.profile);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -1862,7 +1866,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
-  options.maintenance8_enabled = true;
+  options.profile = &Maintenance8Profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -2001,6 +2005,12 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
+  // Host float min/max is used on AMD GPUs, as in Kyty.
+  [[nodiscard]] bool SupportsNativeFloatMinMax() const {
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x1002u;
+  }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
@@ -10868,7 +10878,7 @@ public:
               ShaderRecompiler::CompileOptions options;
               options.wave_size = wave_size;
               options.dump_ir = false;
-              options.maintenance8_enabled = true;
+              options.profile = &Maintenance8Profile;
               input.host_subgroup_size = SubgroupSize();
               options.input_info.compute = &input;
               options.user_data = user_data;
@@ -27932,6 +27942,66 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
+// the emulated rules: a NaN operand yields the other operand and signed zeros are ordered.
+// Denormal operands are left out; their expected results are not pinned down here.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
+  using O = ShaderOpcode;
+  const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+  const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
+  const auto value = [](u32 v) { return std::bit_cast<float>(v); };
+  const auto min2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a | b;
+    return value(a) < value(b) ? a : b;
+  };
+  const auto max2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a & b;
+    return value(a) >= value(b) ? a : b;
+  };
+  constexpr u32 cases[][3] = {
+      {0x40000000u, 0x40400000u, 0x3f800000u}, {0x7fc00000u, 0x40000000u, 0xbf800000u},
+      {0x40000000u, 0x7fc00000u, 0x3f800000u}, {0x7fa00001u, 0x40000000u, 0x40400000u},
+      {0x40000000u, 0x7fa00001u, 0xc0000000u}, {0x80000000u, 0x00000000u, 0x80000000u},
+      {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
+      {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
+      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u}};
+  TestCase test;
+  test.name = "VectorMinMaxF32RuntimeEdges";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    const auto [a, b, c] = cases[index];
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    for (u32 result = 0; result < 4; ++result)
+      AppendStoreVgpr(&code, 10 + result, static_cast<u32>(test.expected.size() + result));
+    test.expected.insert(test.expected.end(),
+                         {min2(a, b), max2(a, b), min2(min2(a, b), c), max2(max2(a, b), c)});
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
+                  O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
@@ -38213,7 +38283,8 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
           "dynamic offsets expanded samples or lost signed six-bit components");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (wave_size == 32u) {
-    Require(test.name, "default feature gate", !ShaderRecompiler::CompileOptions{}.maintenance8_enabled,
+    Require(test.name, "default feature gate",
+            !ShaderRecompiler::CompileOptions{}.profile->maintenance8,
             "maintenance8 must reflect the enabled device feature");
     ExpectFatal("DynamicSampleOffsetsRequireMaintenance8", [&] {
       ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &test.compute_info});
@@ -43052,6 +43123,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(32));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -49007,6 +49080,26 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
+    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
+    // compile it.
+    static constexpr ShaderProfile native_profile{.maintenance8 = true,
+                                                  .native_float_min_max = true};
+    VulkanHarness vulkan;
+    const bool supported = vulkan.SupportsNativeFloatMinMax();
+    for (bool native : {false, true}) {
+      for (auto test :
+           {VectorMinMaxF32NanAndSignedZeroEdges(),
+            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+        spirv = {" NMin ", " NMax "};
+        test.profile = native ? &native_profile : &Maintenance8Profile;
+        test.compile_only = native && !supported;
+        RunCase(&vulkan, test);
+      }
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

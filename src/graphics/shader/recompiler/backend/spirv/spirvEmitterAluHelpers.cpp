@@ -113,6 +113,12 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.profile.native_float_min_max) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+		return result;
+	}
 	return EmitMinMaxF32(state, lhs, rhs, EmitBitcastF32ToU32(state, lhs),
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
