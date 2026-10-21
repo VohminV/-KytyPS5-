@@ -82,19 +82,17 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 }
 
 void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in) {
-	const auto zero     = IR::U32(IR::Value(0u));
-	const auto lhs      = ReadU32(inst.src0);
-	const auto rhs      = ReadU32(inst.src1);
-	const auto carry_in = !use_carry_in ? zero
-	                      : vector      ? ConditionBit(inst.src2)
-	                                    : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc));
-	const auto add0     = ir.Emit(IR::ValueOpcode::IAddCarry32, {lhs, rhs});
-	const auto partial  = ir.CompositeExtract(add0, 0);
-	const auto carry0   = ir.CompositeExtract(add0, 1);
-	const auto add1     = ir.Emit(IR::ValueOpcode::IAddCarry32, {partial, carry_in});
-	const auto result   = ir.CompositeExtract(add1, 0);
-	const auto carry1   = ir.CompositeExtract(add1, 1);
-	const auto carry    = ir.INotEqual(ir.BitwiseOr(carry0, carry1), zero);
+	const auto lhs     = ReadU32(inst.src0);
+	const auto rhs     = ReadU32(inst.src1);
+	const auto partial = ir.IAdd(lhs, rhs);
+	auto       result  = partial;
+	auto       carry   = ir.ULessThan(partial, lhs);
+	if (use_carry_in) {
+		// The carry-in is 0 or 1, so the second add carries out only when it wraps to zero.
+		result = ir.IAdd(partial, vector ? ConditionBit(inst.src2)
+		                                 : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc)));
+		carry  = ir.LogicalOr(carry, ir.ULessThan(result, partial));
+	}
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
 		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));

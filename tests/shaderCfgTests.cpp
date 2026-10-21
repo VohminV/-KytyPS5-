@@ -15144,7 +15144,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
             ValueDependsOn(carry_source->dwords[1],
                            ShaderRecompiler::IR::ValueOpcode::GetShaderBase) &&
             ValueDependsOn(carry_source->dwords[1],
-                           ShaderRecompiler::IR::ValueOpcode::IAddCarry32),
+                           ShaderRecompiler::IR::ValueOpcode::ULessThan32),
         "real s_add_u32/s_addc_u32 translation lost SCC carry provenance");
   std::array<uint32_t, 64> carry_user_data{};
   const uint64_t shader_base = 0x00000012fffffffbull;

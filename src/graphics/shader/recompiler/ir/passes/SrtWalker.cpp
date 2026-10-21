@@ -144,7 +144,6 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
-		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
@@ -348,9 +347,7 @@ private:
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u ||
-			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
-			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
+			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
 				return finish(false);
 			}
 		}
@@ -662,18 +659,6 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	}
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
-	}
-	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
-		uint64_t lhs = 0;
-		uint64_t rhs = 0;
-		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
-			return false;
-		}
-		const auto sum =
-		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-		result =
-		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
-		return true;
 	}
 	return false;
 }

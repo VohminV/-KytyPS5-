@@ -62,7 +62,6 @@ EMIT_NATIVE(IMul32, OpIMul, U32, uint32_t, uint32_t)
 EMIT_NATIVE(UDiv32, OpUDiv, U32, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd64, OpIAdd, U64, uint32_t, uint32_t)
 EMIT_NATIVE(ISub64, OpISub, U64, uint32_t, uint32_t)
-EMIT_NATIVE(IAddCarry32, OpIAddCarry, U32x2, uint32_t, uint32_t)
 uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitUMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitIAbs32 = EmitGlsl<GLSLstd450SAbs, IR::Type::U32, uint32_t>;

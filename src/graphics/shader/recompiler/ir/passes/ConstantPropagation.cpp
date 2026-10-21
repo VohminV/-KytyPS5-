@@ -244,17 +244,6 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 		Replace(inst, producer->Arg(component));
 		return true;
 	}
-	if (component < 2u && producer != nullptr &&
-	    producer->GetOpcode() == ValueOpcode::IAddCarry32) {
-		const auto lhs = producer->Arg(0).Resolve();
-		const auto rhs = producer->Arg(1).Resolve();
-		if (IsImmediate(lhs, Type::U32) && IsImmediate(rhs, Type::U32)) {
-			const auto sum = static_cast<uint64_t>(lhs.U32()) + rhs.U32();
-			Replace(inst, Value(component == 0u ? static_cast<uint32_t>(sum)
-			                                    : static_cast<uint32_t>(sum >> 32u)));
-			return true;
-		}
-	}
 	return false;
 }
 
