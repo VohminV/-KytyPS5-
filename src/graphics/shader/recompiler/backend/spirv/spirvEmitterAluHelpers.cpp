@@ -95,8 +95,8 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 
 static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, uint32_t lhs_bits,
                               uint32_t rhs_bits, bool max_value) {
-	// RDNA2 V_MIN/V_MAX_F32 return the other source for a NaN source (S1 when both are NaN)
-	// and order -0 below +0. An unordered compare keeps S0 for a NaN S1 and, unlike NMin/NMax,
+	// PS5 V_MIN/V_MAX_F32 return the other source for a NaN source (S0 when both are NaN)
+	// and order -0 below +0. An ordered compare takes S1 for a NaN S0 and, unlike NMin/NMax,
 	// always returns the exact bits of one source.
 	const auto either    = EmitOrU32(state, lhs_bits, rhs_bits);
 	const auto both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
@@ -104,11 +104,11 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 	const auto zero =
 	    EmitBitcastU32ToF32(state, max_value ? EmitAndU32(state, lhs_bits, rhs_bits) : either);
 	const auto keep_lhs =
-	    Binary(state, max_value ? spv::OpFUnordGreaterThanEqual : spv::OpFUnordLessThan,
+	    Binary(state, max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
 		       TypeBool(state), lhs, rhs);
 	const auto ordered = Select(state, TypeF32(state), keep_lhs, lhs, rhs);
 	const auto numeric = Select(state, TypeF32(state), both_zero, zero, ordered);
-	return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs), rhs,
+	return Select(state, TypeF32(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs), lhs,
 	              numeric);
 }
 
@@ -127,9 +127,10 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);
 	const auto c_bits = EmitBitcastF32ToU32(state, c);
-	const auto min_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, false);
+	// The NaN path is RDNA2 MIN3, which keeps the later source when two are NaN.
+	const auto min_ba = EmitMinMaxF32(state, b, a, b_bits, a_bits, false);
 	const auto min3 =
-	    EmitMinMaxF32(state, min_ab, c, EmitBitcastF32ToU32(state, min_ab), c_bits, false);
+	    EmitMinMaxF32(state, c, min_ba, c_bits, EmitBitcastF32ToU32(state, min_ba), false);
 	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
 	const auto max3 =
 	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);

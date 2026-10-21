@@ -27966,7 +27966,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
 }
 
 // MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
-// the emulated rules: a NaN operand yields the other operand and signed zeros are ordered.
+// the emulated rules: a NaN operand yields the other (S0 for two NaNs) and signed zeros are
+// ordered.
 // Denormal operands are left out; their expected results are not pinned down here.
 TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   using O = ShaderOpcode;
@@ -27974,14 +27975,14 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
   const auto value = [](u32 v) { return std::bit_cast<float>(v); };
   const auto min2 = [&](u32 a, u32 b) {
-    if (nan(a)) return b;
     if (nan(b)) return a;
+    if (nan(a)) return b;
     if (zero(a) && zero(b)) return a | b;
     return value(a) < value(b) ? a : b;
   };
   const auto max2 = [&](u32 a, u32 b) {
-    if (nan(a)) return b;
     if (nan(b)) return a;
+    if (nan(a)) return b;
     if (zero(a) && zero(b)) return a & b;
     return value(a) >= value(b) ? a : b;
   };
@@ -27991,7 +27992,8 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
       {0x40000000u, 0x7fa00001u, 0xc0000000u}, {0x80000000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
       {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
-      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u}};
+      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u},
+      {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u}};
   TestCase test;
   test.name = "VectorMinMaxF32RuntimeEdges";
   test.has_compute_info = true;
