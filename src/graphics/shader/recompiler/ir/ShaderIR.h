@@ -353,7 +353,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 48u;
+inline constexpr uint32_t ImageBindingCount           = 50u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -367,8 +367,8 @@ enum class DescriptorBindingKind : uint32_t {
 	Count,
 };
 
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -429,8 +429,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 	constexpr uint32_t SampledUintBinding  = 8u;
 	constexpr uint32_t SampledSintBinding  = 15u;
 	constexpr uint32_t StorageFloatBinding = FirstStorageImageBinding;
-	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 5u;
-	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 5u;
+	constexpr uint32_t StorageUintBinding  = StorageFloatBinding + 6u;
+	constexpr uint32_t AtomicUintBinding   = StorageUintBinding + 6u;
 
 	uint32_t base    = 0;
 	bool     sampled = false;
@@ -477,10 +477,10 @@ DescriptorBindingForImage(const ImageResource& image) {
 		case Decoder::ImageDimension::Dim2D: dimension = 2u; break;
 		case Decoder::ImageDimension::Dim2DArray: dimension = 3u; break;
 		case Decoder::ImageDimension::Dim2DMsaa:
-			if (!sampled) {
+			if (image.atomic) {
 				return std::nullopt;
 			}
-			dimension = 4u;
+			dimension = sampled ? 4u : 5u;
 			break;
 		case Decoder::ImageDimension::Dim2DMsaaArray:
 			if (!sampled) {

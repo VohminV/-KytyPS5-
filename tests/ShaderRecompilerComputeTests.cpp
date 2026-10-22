@@ -12664,6 +12664,95 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Cyberpunk 2077 clears a rect of an MSAA color target from compute, one sample per store.
+  void CheckMsaaStorageClear() {
+    constexpr const char *name = "MsaaStorageClear";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    // Captured CS 0xad6c86aca9c0916e: s[8:11] color, s[12:13] origin, s14 width,
+    // s15 height << 16 | samples.
+    std::vector<u32> clear{0xbfa00001u, 0xd7460001u, 0x04050611u, 0xd7460000u, 0x04010610u,
+                           0x7da21ef9u, 0x85060001u, 0x7da8000eu, 0xbf88000fu, 0x4a08000cu,
+                           0x4a0a020du, 0x996b800fu, 0xbeea0380u, 0xbf0a6b6au, 0xbf840009u,
+                           0x7e0c026au, 0x7e000208u, 0x7e020209u, 0x7e04020au, 0x7e06020bu,
+                           0x816a816au, 0xf0200f30u, 0x00000004u, 0xbf82fff5u, 0xbf810000u};
+    ShaderMapUserData(reinterpret_cast<uint64_t>(clear.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(clear.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "MSAA allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "MSAA mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      // 8x8 4x MSAA RGBA8: LAST_LEVEL and MAX_MIP hold log2(samples).
+      const ShaderTextureResource target{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) | (3u << 30u),
+          1u | (7u << 14u),
+          DstSel(4, 5, 6, 7) | (2u << 16u) |
+              (static_cast<u32>(Prospero::TileMode::kRenderTarget) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2DMsaa) << 28u),
+          0, 0x00700020u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(target.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
+      resource.written = true;
+      const auto binding =
+          RenderExecutorTestAccess::ResolveTexture(context.GetRenderExecutor(), resource, value);
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), binding.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(clear.data()),
+                           .num_thread_x = 8, .num_thread_y = 8, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 16, .tgid_x_en = true,
+                           .tgid_y_en = true, .tidig_comp_cnt = 1});
+      const std::array<u32, 8> args{std::bit_cast<u32>(1.0f), 0, 0, std::bit_cast<u32>(1.0f),
+                                    1, 1, 2, (2u << 16u) | 4u};
+      for (u32 i = 0; i < 8; i++) {
+        shaders.SetCsUserSgpr(i, target.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(8u + i, args[i], HW::UserSgprType::Unknown);
+      }
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      for (const int row : {1, 2, 3}) {
+        const u32 inside = row == 3 ? 0u : 0xff0000ffu;
+        Require(name, "every sample in the rect",
+                ReadCachedTexel(name, context, binding.image_id, {0, row, 0}, {4, 1, 1}) ==
+                    std::vector<u32>{0, inside, inside, 0},
+                "the compute clear missed samples or wrote outside its rect");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "MSAA mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "MSAA allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckSampledDccClear() {
     constexpr const char *name = "SampledDccClear";
     constexpr uintptr_t base = 0x0000000205000000ull;
@@ -21072,6 +21161,7 @@ private:
     device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
+    device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
@@ -49939,6 +50029,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSamplePacked8<false, true>());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMsaaStorageClear();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-bits-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDepthBitsCopy();
@@ -50843,6 +50938,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
+    vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
