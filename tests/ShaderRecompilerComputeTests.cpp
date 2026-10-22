@@ -1,6 +1,7 @@
 #define SPV_ENABLE_UTILITY_CODE
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -12335,7 +12336,15 @@ public:
         Require(name, "already GPU-owned metadata stays ordered",
                 resources.GetBufferCache().HasGpuDirtyBytes(dcc_address, metadata_size),
                 "a fill discarded pending native writes to its metadata pages");
+        Common::DebugCounters::SetEnabled(true);
+        const auto readbacks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
         bind();
+        Common::DebugCounters::SetEnabled(false);
+        Require(name, "metadata readback counter",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks + 1,
+                "binding GPU-written metadata did not count exactly one readback");
         Require(name, "same-value raw native re-clear",
                 read_texel() == expected,
                 "a repeated metadata fill did not clear an already drawn target");
