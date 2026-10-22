@@ -1602,29 +1602,8 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
 		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
 		                     range.levelCount != 1);
-		ImageViewInfo view {};
-		view.format = format;
-		view.type   = range.layerCount == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-		view.base_level  = range.baseMipLevel;
-		view.base_layer  = range.baseArrayLayer;
-		view.layer_count = range.layerCount;
-		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
-		vk::RenderingAttachmentInfo attachment {};
-		attachment.imageView   = image.FindView(view);
-		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-		attachment.loadOp      = vk::AttachmentLoadOp::eClear;
-		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-		attachment.clearValue  = clear;
-		vk::RenderingInfo rendering {};
-		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
-		rendering.layerCount           = range.layerCount;
-		rendering.colorAttachmentCount = 1;
-		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
+		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
+		                    range.layerCount, &clear, command.Handle());
 		command.Handle().endRendering();
 		CommitGpuWrite(image);
 		return;
@@ -1659,6 +1638,38 @@ void TextureCache::PrepareCpuWrite(uint64_t address, uint64_t size) {
 			(void)DownloadImageMemory(id, true);
 		}
 	}
+vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+                                             uint32_t layer, uint32_t layers,
+                                             const vk::ClearValue* clear,
+                                             vk::CommandBuffer     command) {
+	ImageViewInfo view {};
+	view.format      = format;
+	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	view.base_level  = level;
+	view.base_layer  = layer;
+	view.layer_count = layers;
+	view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, command);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	if (clear != nullptr) {
+		attachment.loadOp     = vk::AttachmentLoadOp::eClear;
+		attachment.clearValue = *clear;
+	}
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = {std::max(image.info.extent.width >> level, 1u),
+	                                  std::max(image.info.extent.height >> level, 1u)};
+	rendering.layerCount           = layers;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	return rendering.renderArea;
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
