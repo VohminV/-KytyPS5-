@@ -39,6 +39,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -49177,6 +49178,94 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// waitUntilSafeForRendering stalls only its own command processor (SDK), and a display buffer
+// stays busy while its flip is pending or while it is on screen.
+void CheckWaitUntilSafeForRendering() {
+  constexpr const char *name = "WaitUntilSafeForRendering";
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+  auto &gpu = renderer.GetGpu();
+
+  constexpr int user_system = 255;
+  constexpr int bus_main = 0;
+  constexpr int flip_mode_vsync = 1;
+  // Special buffer indices flip without a registered surface.
+  constexpr int index_blank = -1;
+  constexpr int index_black = -2;
+  const int handle = VideoOut::VideoOutOpen(user_system, bus_main, 0, nullptr);
+  Require(name, "open", handle > 0, "video-out open failed");
+  const auto wait_until = [](const auto &done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return done();
+  };
+  const auto address = [](const void *value) { return reinterpret_cast<uint64_t>(value); };
+
+  // Hold the graphics queue so the CPU flip of BLACK, prepared behind it, stays pending.
+  std::atomic_uint32_t gate{0};
+  std::array<uint32_t, 7> hold{};
+  hold[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+  hold[1] = 0x10u | 3u;
+  hold[2] = static_cast<uint32_t>(address(&gate));
+  hold[3] = static_cast<uint32_t>(address(&gate) >> 32u);
+  hold[4] = 1;
+  hold[5] = UINT32_MAX;
+  gpu.Submit(hold, {});
+  Require(name, "flip black",
+          VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
+          "CPU flip failed");
+
+  std::atomic_uint32_t rendered{0};
+  std::array<uint32_t, 12> render{};
+  render[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
+  render[1] = static_cast<uint32_t>(handle);
+  render[2] = static_cast<uint32_t>(index_black);
+  render[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  render[9] = static_cast<uint32_t>(address(&rendered));
+  render[10] = static_cast<uint32_t>(address(&rendered) >> 32u);
+  render[11] = 1;
+  gpu.SubmitCompute(0x20, render);
+
+  std::binary_semaphore lane{0};
+  std::jthread command_lane([&] {
+    gpu.SendCommandSync([] {});
+    lane.release();
+  });
+  Require(name, "command lane", lane.try_acquire_for(std::chrono::seconds(2)),
+          "a busy display buffer blocked the GPU thread");
+  Require(name, "pending", rendered.load() == 0,
+          "rendering started while its display buffer had a pending flip");
+
+  gate.store(1);
+  Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
+          "the BLACK flip was not presented");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  Require(name, "displayed", rendered.load() == 0,
+          "rendering started while its display buffer was on screen");
+
+  Require(name, "flip blank",
+          VideoOut::VideoOutSubmitFlip(handle, index_blank, flip_mode_vsync, 0) == 0,
+          "CPU flip failed");
+  Require(name, "resume", wait_until([&] { return rendered.load() == 1; }),
+          "rendering did not resume once its display buffer left the screen");
+
+  gpu.WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0, "video-out close failed");
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -50056,6 +50145,10 @@ int main(int argc, char **argv) {
     vulkan.CheckScalarLeafCall();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wait-until-safe-for-rendering-only") == 0) {
+    CheckWaitUntilSafeForRendering();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
@@ -50615,6 +50708,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
+  // Last: its window installs global GPU resources.
+  CheckWaitUntilSafeForRendering();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
