@@ -404,9 +404,9 @@ struct RenderExecutorTestAccess {
     return executor.DrawIndex(0, command, args);
   }
 
-  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    executor.DrawAuto(0, command, args);
+    return executor.DrawAuto(0, command, args);
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -18728,9 +18728,9 @@ public:
         }
       }
 
-      // Embedded fetches take indirect records from the GPU copy: the first draws degenerate
-      // vertices 0-2, the second's vertex offset 7 selects the covering triangle. The CPU
-      // backing holds zeros. Other vertex shaders read the records on the CPU.
+      // Indirect records come from the GPU copy; the CPU backing holds zeros. In each pair the
+      // first record draws nothing and the second covers the target, through vertex offset 7
+      // for embedded fetches.
       {
         constexpr uint64_t vertices_address = depth_address + 0x38000;
         constexpr uint64_t args_address = vertices_address + 0x100;
@@ -18740,14 +18740,20 @@ public:
         std::memcpy(reinterpret_cast<void *>(vertices_address), positions.data(),
                     sizeof(positions));
         constexpr uint32_t stride = 32;
-        const vk::DrawIndexedIndirectCommand degenerate{3, 1, 0, 0, 5};
-        const vk::DrawIndexedIndirectCommand covering{3, 1, 0, 7, 5};
-        std::memcpy(reinterpret_cast<void *>(args_address), &degenerate, sizeof(degenerate));
-        std::memcpy(reinterpret_cast<void *>(args_address + stride), &covering, sizeof(covering));
+        const vk::DrawIndexedIndirectCommand indexed_records[]{
+            {3, 1, 0, 0, 5}, {3, 1, 0, 7, 5}, {0, 1, 0, 0, 0}, {3, 1, 0, 0, 0}};
+        const vk::DrawIndirectCommand auto_records[]{{3, 1, 0, 5}, {3, 1, 7, 5}, {0, 1, 0, 0},
+                                                     {3, 1, 0, 0}};
+        for (u32 i = 0; i < 4; i++) {
+          std::memcpy(reinterpret_cast<void *>(args_address + i * stride), &indexed_records[i],
+                      sizeof(indexed_records[i]));
+          std::memcpy(reinterpret_cast<void *>(args_address + (4 + i) * stride), &auto_records[i],
+                      sizeof(auto_records[i]));
+        }
         // Larger than a caching page, so the arguments are cached instead of streamed.
         (void)context.GetBufferCache().ObtainBuffer(
             vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
-        const std::array<u32, 2 * stride / 4> zeros{};
+        const std::array<u32, 8 * stride / 4> zeros{};
         Require("GpuIndirectDraw", "CPU backing",
                 LibKernel::Memory::TryWriteBacking(args_address, zeros.data(), sizeof(zeros)),
                 "the CPU copy of the arguments could not be cleared");
@@ -18788,26 +18794,29 @@ public:
           shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)),
                                 HW::UserSgprType::Unknown);
         }
-        const DrawIndexArgs indirect{
-            .index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
-            .index_type_and_size = 1, .indirect = {args_address, 2, stride}};
-        shaders.SetEsShaderBase(fetch_vs);
-        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
-            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-        Require("GpuIndirectDraw", "embedded fetch",
-                RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(), indirect),
-                "an embedded-fetch indirect draw fell back to CPU arguments");
-        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
-                                            {}, {extent, extent, 1});
-        for (size_t component = 0; component < pixels.size(); component++) {
-          Require("GpuIndirectDraw", "vertex offset",
-                  pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
-                  "the draw did not take every record, vertex offset included, from the GPU");
-        }
-        shaders.SetEsShaderBase(indirect_vs);
-        Require("GpuIndirectDraw", "CPU fallback",
-                !RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(), indirect),
-                "GPU-read arguments reached a shader without embedded fetch");
+        const auto check = [&](const char *step, uint64_t vertex_shader, bool indexed, u32 first) {
+          shaders.SetEsShaderBase(vertex_shader);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const DrawIndirectArgs records{args_address + first * stride, 2, stride};
+          const bool drawn = indexed
+              ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                    {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                     .index_type_and_size = 1, .indirect = records})
+              : RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                   {.indirect = records});
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            Require("GpuIndirectDraw", step,
+                    drawn && pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the draw did not take every record, offsets included, from the GPU");
+          }
+        };
+        check("indexed embedded fetch", fetch_vs, true, 0);
+        check("auto embedded fetch", fetch_vs, false, 4);
+        check("indexed native fetch", vertex_address, true, 2);
+        check("auto native fetch", vertex_address, false, 6);
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.

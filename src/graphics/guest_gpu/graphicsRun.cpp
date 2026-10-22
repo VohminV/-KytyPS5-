@@ -903,14 +903,18 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
-	// With no SGPRs to patch, the GPU reads indexed draws' arguments if the shaders allow.
-	if (indexed && m_index_buffer_size != 0 && registers.vertex_offset == Pm4::SH_NOP &&
-	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP &&
-	    executor.DrawIndex(m_submit_id, CurrentBuffer(),
-	                       {.index_count         = m_index_buffer_size,
-	                        .index_addr          = IndexAddress(0),
-	                        .index_type_and_size = m_index_type_and_size,
-	                        .indirect            = {args_addr, draw_count, stride_in_bytes}})) {
+	// With no SGPRs to patch, the GPU reads the records if the shaders allow. Shaders apply
+	// the records' offsets only through those SGPRs; Vulkan applies them, which matches
+	// while they are zero.
+	const DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	if (registers.vertex_offset == Pm4::SH_NOP && registers.instance_offset == Pm4::SH_NOP &&
+	    registers.index_offset == Pm4::SH_NOP && (!indexed || m_index_buffer_size != 0) &&
+	    (indexed ? executor.DrawIndex(m_submit_id, CurrentBuffer(),
+	                                  {.index_count         = m_index_buffer_size,
+	                                   .index_addr          = IndexAddress(0),
+	                                   .index_type_and_size = m_index_type_and_size,
+	                                   .indirect            = records})
+	             : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records}))) {
 		return;
 	}
 

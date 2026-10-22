@@ -48,7 +48,7 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count VkDrawIndexedIndirectCommand records, stride bytes apart.
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
 	uint64_t address = 0;
 	uint32_t count   = 0;
@@ -75,6 +75,7 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	DrawIndirectArgs indirect;
 };
 
 struct SubmitInfo {
@@ -172,9 +173,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	// False, with nothing drawn, when the shaders cannot take indirect records from the GPU.
+	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
