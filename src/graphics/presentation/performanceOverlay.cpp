@@ -313,6 +313,7 @@ void GpuActivityRows(const Snapshot& shown) {
 	Row("DCC/CMASK readbacks",
 	    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
 	        Rate(shown, Counter::ColorMetadataReadbacks)));
+	Row("DCC/CMASK GPU checks", Fmt("%.0f/s", Rate(shown, Counter::ColorMetadataChecks)));
 }
 
 void CompilationRows(const Snapshot& shown) {

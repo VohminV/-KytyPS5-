@@ -14,6 +14,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_3d_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_color_transform_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_clear_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -71,8 +72,8 @@ TileManager::~TileManager() {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
 		}
 	}
-	for (auto pipeline:
-	     {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform}) {
+	for (auto pipeline: {m_d16_to_d24, m_d16_to_d32, m_d24_to_d16, m_d32_to_d16, m_color_transform,
+	                     m_color_clear}) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
 		}
@@ -625,6 +626,62 @@ TileManager::Result TileManager::TransformColor(Result input, ColorTransform tra
 	auto result = GetScratchBuffer(input.size, input.buffer);
 	TransformColor(input, result, transform, to_host);
 	return result;
+}
+
+vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
+                                        bool expand) {
+	struct Check {
+		uint32_t metadata_base;
+		uint32_t words;
+		uint32_t keys;
+		uint32_t expand;
+	};
+	static_assert(sizeof(Check) <= sizeof(Conversion));
+	const uint32_t max_slices =
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers;
+	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % (4ull * slices) != 0 ||
+	        metadata.size / 4 > UINT32_MAX);
+	if (m_color_clear == nullptr) {
+		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
+		m_clear_predicates = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer |
+		        vk::BufferUsageFlagBits::eConditionalRenderingEXT,
+		    uint64_t {max_slices} * ColorClearSlots * sizeof(uint32_t));
+	}
+	const auto source = BindStorage(metadata, metadata.size);
+	const vk::DescriptorBufferInfo infos[] {source.info,
+	                                        {m_clear_predicates->Handle(), 0, VK_WHOLE_SIZE}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); index++) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+	// Orders the metadata writers and the previous check's predicate reads before this check.
+	vk::MemoryBarrier barrier {
+	    .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
+	                        0, nullptr);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
+	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
+	                  expand};
+	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+	                      &push);
+	command.dispatch(slices, 1, 1);
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+	                        0, nullptr);
+	return m_clear_predicates->Handle();
 }
 
 } // namespace Libs::Graphics

@@ -10335,6 +10335,32 @@ public:
                   ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
                       std::vector<u32>{0x5a5a5a5a},
               "clearing one volume slice changed untouched slice contents");
+      // A GPU writer clears slice 9's metadata; its bind selects the clear on the GPU.
+      auto [writer, writer_offset] = resources.GetBufferCache().ObtainBuffer(
+          dcc_address + 9 * metadata_slice_size, metadata_slice_size, true);
+      writer->Fill(writer_offset, metadata_slice_size, 0);
+      Common::DebugCounters::SetEnabled(true);
+      const auto readbacks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
+      const auto checks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetColorView(0, {.base_array_slice_index = 9, .last_array_slice_index = 9});
+      RenderColorInfo gpu_slice{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), gpu_slice, 0);
+      Common::DebugCounters::SetEnabled(false);
+      Require(name, "GPU-written volume metadata clears on the GPU",
+              gpu_slice.image_id == color.image_id &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataChecks) == checks + 1 &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 9}) ==
+                      std::vector<u32>{0} &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "a volume slice's GPU-written metadata was read back or cleared other slices");
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;
       storage_desc.info.metadata = {};
@@ -12340,14 +12366,43 @@ public:
         const auto readbacks =
             Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
         bind();
-        Common::DebugCounters::SetEnabled(false);
-        Require(name, "metadata readback counter",
-                Common::DebugCounters::Get(
-                    Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks + 1,
-                "binding GPU-written metadata did not count exactly one readback");
         Require(name, "same-value raw native re-clear",
                 read_texel() == expected,
                 "a repeated metadata fill did not clear an already drawn target");
+        const auto checks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+        bind();
+        Require(name, "checked metadata skips rebinding",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataChecks) == checks,
+                "rebinding unwritten GPU-checked metadata repeated its clear check");
+        check_expanded_metadata();
+        paint();
+        fill_metadata(metadata_words - 1, true);
+        bind();
+        Require(name, "partial raw native metadata fill", retains_painted_texel(),
+                "a nonuniform GPU-written metadata slice cleared the whole target");
+        fill_metadata(metadata_words, true);
+        bind();
+        Require(name, "complete raw native fill after partial fill", read_texel() == expected,
+                "completing a GPU-written metadata fill did not restore its clear");
+        if (layout == Prospero::ChannelLayout::k16_16_16_16 && !fill_case.cmask &&
+            !fill_case.reuse_unorm) {
+          auto video = color.desc;
+          video.type = BindingType::VideoOut;
+          paint();
+          fill_metadata(metadata_words, true);
+          const bool cleared =
+              texture_cache.FindImage(video) == color.image_id && read_texel() == expected;
+          std::vector<uint32_t> keys(metadata_words);
+          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
+          Require(name, "video-out clear keeps its metadata keys",
+                  cleared &&
+                      LibKernel::Memory::TryReadBacking(dcc_address, keys.data(), metadata_size) &&
+                      std::ranges::all_of(keys,
+                                          [&](uint32_t word) { return word == fill_case.fill; }),
+                  "a video-out bind skipped its clear or expanded the flip's metadata keys");
+        }
         paint();
         WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
         fill_metadata(metadata_words - 1);
@@ -12356,15 +12411,15 @@ public:
                 retains_painted_texel(),
                 "a nonuniform metadata allocation cleared the whole target");
         fill_metadata(metadata_words);
-        if (fill_case.goat) {
-          Require(name, "repeated Goat fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
-                  "re-clearing expanded metadata required another GPU readback");
-        }
         bind();
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+        Common::DebugCounters::SetEnabled(false);
+        Require(name, "GPU-written metadata stays on the GPU",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks,
+                "binding GPU-written color metadata read it back");
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
@@ -20503,6 +20558,7 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.maintenance8_enabled = true;
+    m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -20786,7 +20842,10 @@ private:
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
-    device_info.pNext = &robustness2;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+    conditional_rendering.conditionalRendering = true;
+    conditional_rendering.pNext = &robustness2;
+    device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -20805,7 +20864,8 @@ private:
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+        VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
