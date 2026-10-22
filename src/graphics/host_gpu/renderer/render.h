@@ -48,6 +48,13 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// Nonzero address: the GPU reads count VkDrawIndexedIndirectCommand records, stride bytes apart.
+struct DrawIndirectArgs {
+	uint64_t address = 0;
+	uint32_t count   = 0;
+	uint32_t stride  = 0;
+};
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -57,8 +64,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
-	// Nonzero: the GPU reads this VkDrawIndexedIndirectCommand; index_count is INDEX_BUFFER_SIZE.
-	uint64_t indirect_args = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
@@ -165,7 +172,7 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	// False, with nothing drawn, when the shaders cannot take indirect_args from the GPU.
+	// False, with nothing drawn, when the shaders cannot take indirect records from the GPU.
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 

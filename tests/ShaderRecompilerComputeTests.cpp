@@ -18728,9 +18728,9 @@ public:
         }
       }
 
-      // Embedded fetches take indirect arguments from the GPU copy, whose vertex offset 7
-      // selects the covering triangle; the CPU backing holds zeros. Other vertex shaders read
-      // the arguments on the CPU.
+      // Embedded fetches take indirect records from the GPU copy: the first draws degenerate
+      // vertices 0-2, the second's vertex offset 7 selects the covering triangle. The CPU
+      // backing holds zeros. Other vertex shaders read the records on the CPU.
       {
         constexpr uint64_t vertices_address = depth_address + 0x38000;
         constexpr uint64_t args_address = vertices_address + 0x100;
@@ -18739,14 +18739,17 @@ public:
         std::ranges::copy(triangle, positions.begin() + 28);
         std::memcpy(reinterpret_cast<void *>(vertices_address), positions.data(),
                     sizeof(positions));
-        const vk::DrawIndexedIndirectCommand args{3, 1, 0, 7, 5};
-        std::memcpy(reinterpret_cast<void *>(args_address), &args, sizeof(args));
+        constexpr uint32_t stride = 32;
+        const vk::DrawIndexedIndirectCommand degenerate{3, 1, 0, 0, 5};
+        const vk::DrawIndexedIndirectCommand covering{3, 1, 0, 7, 5};
+        std::memcpy(reinterpret_cast<void *>(args_address), &degenerate, sizeof(degenerate));
+        std::memcpy(reinterpret_cast<void *>(args_address + stride), &covering, sizeof(covering));
         // Larger than a caching page, so the arguments are cached instead of streamed.
         (void)context.GetBufferCache().ObtainBuffer(
             vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
-        const vk::DrawIndexedIndirectCommand zero_args{};
+        const std::array<u32, 2 * stride / 4> zeros{};
         Require("GpuIndirectDraw", "CPU backing",
-                LibKernel::Memory::TryWriteBacking(args_address, &zero_args, sizeof(zero_args)),
+                LibKernel::Memory::TryWriteBacking(args_address, zeros.data(), sizeof(zeros)),
                 "the CPU copy of the arguments could not be cleared");
         static const auto fetch_vertex = [] {
           std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
@@ -18787,7 +18790,7 @@ public:
         }
         const DrawIndexArgs indirect{
             .index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
-            .index_type_and_size = 1, .indirect_args = args_address};
+            .index_type_and_size = 1, .indirect = {args_address, 2, stride}};
         shaders.SetEsShaderBase(fetch_vs);
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
@@ -18799,7 +18802,7 @@ public:
         for (size_t component = 0; component < pixels.size(); component++) {
           Require("GpuIndirectDraw", "vertex offset",
                   pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
-                  "the draw did not take its arguments, vertex offset included, from the GPU");
+                  "the draw did not take every record, vertex offset included, from the GPU");
         }
         shaders.SetEsShaderBase(indirect_vs);
         Require("GpuIndirectDraw", "CPU fallback",
@@ -20842,6 +20845,7 @@ private:
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.drawIndirectFirstInstance &&
+                                available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
@@ -20935,6 +20939,7 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
+    device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{

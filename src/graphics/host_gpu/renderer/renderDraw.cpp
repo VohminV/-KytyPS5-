@@ -633,10 +633,10 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 }
 
 struct DrawEmitInfo {
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
-	uint32_t first_instance = 0;
-	uint64_t indirect_args  = 0;
+	int32_t          vertex_offset  = 0;
+	uint32_t         first_vertex   = 0;
+	uint32_t         first_instance = 0;
+	DrawIndirectArgs indirect;
 };
 
 struct DrawIndexBufferSource {
@@ -1241,11 +1241,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	std::pair<Buffer*, uint64_t> indirect {};
-	if (emit.indirect_args != 0) {
-		indirect = m_context.GetBufferCache().ObtainBuffer(
-		    emit.indirect_args, sizeof(vk::DrawIndexedIndirectCommand), false);
-		EXIT_IF((indirect.second & 3u) != 0);
+	std::pair<Buffer*, uint64_t> args_buffer {};
+	if (emit.indirect.address != 0) {
+		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+		                  sizeof(vk::DrawIndexedIndirectCommand);
+		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1338,8 +1339,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (indirect.first != nullptr) {
-		vk_buffer.drawIndexedIndirect(indirect.first->Handle(), indirect.second, 1, 0);
+	} else if (args_buffer.first != nullptr) {
+		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
+		                              emit.indirect.count, emit.indirect.stride);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -1374,7 +1376,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect_args == 0)) {
+	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
 
@@ -1457,7 +1459,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 	// Only embedded fetches apply Vulkan's offsets; mesh and quad-list draws need CPU counts.
-	if (args.indirect_args != 0 &&
+	if (args.indirect.address != 0 &&
 	    (!state.vertex_info[0].fetch_embedded ||
 	     state.vertex_info[0].stage.program->stage == ShaderType::Mesh ||
 	     ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy)) {
@@ -1475,7 +1477,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
-	emit.indirect_args  = args.indirect_args;
+	emit.indirect       = args.indirect;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
