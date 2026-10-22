@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryTuning.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -247,7 +249,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload,
+                       MemoryTuning::GetStagingBytes()),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
@@ -265,13 +268,31 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
 	constexpr int64_t target_threshold = 8 * GiB;
+	const auto        budget_bytes     = m_graphics.GetTotalMemoryBudget();
 	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	    static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
+	const bool discrete = m_graphics.physical_device_properties.deviceType ==
+	                      vk::PhysicalDeviceType::eDiscreteGpu;
+	auto base = discrete ? m_graphics.GetDeviceLocalMemorySize() : budget_bytes;
+	if (base == 0) {
+		base = budget_bytes;
+	}
+	MemoryTuning::Watermarks watermarks;
+	if (MemoryTuning::GetWatermarks(base, budget_bytes, watermarks)) {
+		m_trigger_gc_memory  = watermarks.trigger;
+		m_critical_gc_memory = watermarks.critical;
+		std::fprintf(stderr,
+		             "[memory-tuning] buffer GC (%s): trigger=%llu MiB critical=%llu MiB\n",
+		             MemoryTuning::IsAutomaticLowVramProfile(base) ? "auto low-vram" : "env",
+		             static_cast<unsigned long long>(m_trigger_gc_memory / (1024ull * 1024ull)),
+		             static_cast<unsigned long long>(m_critical_gc_memory / (1024ull * 1024ull)));
+	} else {
+		const auto threshold = std::min(budget, target_threshold);
+		const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
+		const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+		m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
+		m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	}
 }
 
 BufferCache::~BufferCache() {

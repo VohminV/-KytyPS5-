@@ -63,8 +63,18 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		const auto invalidate = [this, fault_vaddr] {
+			m_texture_cache.PrepareCpuWrite(fault_vaddr, fault_size);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		};
+		if (m_gpu != nullptr && !m_gpu->IsStopping() &&
+		    !CommandScheduler::InDeferredOperation()) {
+			m_gpu->SendCommandSync(invalidate);
+		} else {
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}

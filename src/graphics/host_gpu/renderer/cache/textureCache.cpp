@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryTuning.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -21,8 +22,10 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -125,14 +128,36 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
+		const auto        budget_bytes = m_graphics.GetTotalMemoryBudget();
 		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		    static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
+		const bool discrete = m_graphics.physical_device_properties.deviceType ==
+		                      vk::PhysicalDeviceType::eDiscreteGpu;
+		auto base = discrete ? m_graphics.GetDeviceLocalMemorySize() : budget_bytes;
+		if (base == 0) {
+			base = budget_bytes;
+		}
+		MemoryTuning::Watermarks watermarks;
+		if (MemoryTuning::GetWatermarks(base, budget_bytes, watermarks)) {
+			m_trigger_gc_memory  = watermarks.trigger;
+			m_pressure_gc_memory = watermarks.pressure;
+			m_critical_gc_memory = watermarks.critical;
+			std::fprintf(stderr,
+			             "[memory-tuning] texture GC (%s): trigger=%llu MiB pressure=%llu MiB "
+			             "critical=%llu MiB\n",
+			             MemoryTuning::IsAutomaticLowVramProfile(base) ? "auto low-vram" : "env",
+			             static_cast<unsigned long long>(m_trigger_gc_memory / (1024ull * 1024ull)),
+			             static_cast<unsigned long long>(m_pressure_gc_memory / (1024ull * 1024ull)),
+			             static_cast<unsigned long long>(m_critical_gc_memory / (1024ull * 1024ull)));
+		} else {
+			const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+			m_pressure_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+			    std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+			m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+			    std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+			m_trigger_gc_memory =
+			    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		}
 	}
 }
 
@@ -1609,6 +1634,20 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	CommitGpuWrite(image);
 }
 
+void TextureCache::PrepareCpuWrite(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->Overlaps(address, size) && image->SafeToDownload() &&
+		    CanDownload(*image)) {
+			(void)DownloadImageMemory(id, true);
+		}
+	}
+}
+
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
@@ -1746,7 +1785,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool synchronous) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1754,20 +1793,37 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
+	if (synchronous && CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
 	const auto range    = image.info.data;
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	std::unique_ptr<Buffer> temporary;
+	Buffer*                 destination = &download;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, range.size);
+		mapped      = temporary->Mapped().data();
+		offset      = 0;
+		destination = temporary.get();
+		if (mapped == nullptr) {
+			return false;
+		}
+	} else {
+		download.Commit();
 	}
-	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	if (temporary) {
+		temporary->Flush(0, range.size);
+	} else {
+		download.Flush(offset, range.size);
+	}
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	DownloadImage(image, *destination, offset, range.size, image.info.resources.levels);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
@@ -1775,17 +1831,29 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = destination->Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
+	auto publish = [&download, range, mapped, offset, owner = std::move(temporary)] {
+		if (owner) {
+			owner->Invalidate(0, range.size);
+		} else {
+			download.Invalidate(offset, range.size);
+		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	};
+	if (synchronous) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		publish();
+	} else {
+		m_scheduler.DeferPriorityOperation(std::move(publish));
+	}
 	return true;
 }
 

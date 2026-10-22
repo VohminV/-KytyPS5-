@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/memoryTuning.h"
 #include "graphics/host_gpu/rangeSet.h"
 
 #include <atomic>
@@ -312,6 +313,26 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+void TestMemoryTuning() {
+  using namespace Libs::Graphics::MemoryTuning;
+  constexpr uint64_t GiB = 1024ull * 1024ull * 1024ull;
+  const auto watermarks = ComputeWatermarks(Limits{}, 8 * GiB, 7 * GiB);
+  const auto scaled = [](uint64_t bytes, float fraction) {
+    return static_cast<uint64_t>(static_cast<long double>(bytes) * fraction);
+  };
+  Check(watermarks.trigger == scaled(8 * GiB, 0.72f) &&
+            watermarks.pressure == scaled(8 * GiB, 0.78f) &&
+            watermarks.critical == scaled(8 * GiB, 0.84f),
+        "low-VRAM watermarks did not follow the 72/78/84 profile");
+  const auto capped = ComputeWatermarks(Limits{}, 8 * GiB, 4 * GiB);
+  Check(capped.trigger == 4 * GiB && capped.pressure == 4 * GiB &&
+            capped.critical == 4 * GiB,
+        "watermarks were not capped by the Vulkan budget");
+  Check(IsLowVramHeap(8 * GiB) && IsLowVramHeap(LOW_VRAM_HEAP_LIMIT) &&
+            !IsLowVramHeap(LOW_VRAM_HEAP_LIMIT + 1) && !IsLowVramHeap(0),
+        "low-VRAM heap classification changed");
 }
 
 void TestGuestRange() {
@@ -1275,6 +1296,7 @@ int main(int argc, char **argv) {
     BenchmarkCleanUploads();
     return 0;
   }
+  TestMemoryTuning();
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();

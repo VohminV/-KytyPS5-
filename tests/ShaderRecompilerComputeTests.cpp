@@ -5541,6 +5541,75 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckTextureCpuWriteReadback() {
+    constexpr const char *name = "TextureCpuWriteReadback";
+    constexpr uintptr_t base = 0x0000000205a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint32_t gpu_value = 0xdeadbeefu;
+    constexpr uint32_t cpu_value = 0x13579bdfu;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &direct_offset) == 0,
+            "texture CPU-write test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "texture CPU-write test direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    constexpr std::array<uint32_t, 2> initial{0x11111111u, 0x22222222u};
+    std::memcpy(memory, initial.data(), sizeof(initial));
+
+    {
+      auto &resources = context;
+      Libs::LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, size);
+      auto desc = MakeLinearDesc(base, sizeof(initial), vk::Format::eR32Uint,
+                                 Prospero::BufferFormat::k32UInt,
+                                 Prospero::ImageType::kColor2D, {2, 1, 1}, 1, 4,
+                                 1);
+      const auto image = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image, desc);
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = gpu_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      Require(name, "CPU write fault",
+              resources.HandleFault(PageFaultAccess::Write, base),
+              "texture CPU-write fault was not handled");
+      std::memcpy(memory, &cpu_value, sizeof(cpu_value));
+      (void)texture_cache.FindTexture(image, desc);
+      Require(name, "GPU texels retained",
+              ReadCachedTexel(name, context, image, {}, {2, 1, 1}) ==
+                  std::vector<u32>{cpu_value, gpu_value},
+              "a CPU write discarded GPU texels that were not overwritten");
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "mapping release",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "texture CPU-write mapping release failed");
+    Require(name, "physical release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               size) == 0,
+            "texture CPU-write physical release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -17349,7 +17418,7 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
+      return *context.GetPipelineCache().GetGraphicsPipeline(
           std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
           topology, false,
           PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
@@ -49003,6 +49072,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-cpu-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureCpuWriteReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
@@ -49282,6 +49356,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckTextureCpuWriteReadback();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

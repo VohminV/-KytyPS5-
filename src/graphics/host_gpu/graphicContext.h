@@ -102,6 +102,16 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	[[nodiscard]] uint64_t GetDeviceLocalMemorySize() const noexcept {
+		uint64_t size = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+			if (static_cast<bool>(properties.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+				size += properties.size;
+			}
+		}
+		return size;
+	}
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
