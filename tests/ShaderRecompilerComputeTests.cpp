@@ -1619,6 +1619,17 @@ void CheckRectListShaders() {
   ValidateSpirv(name, position_only.evaluation);
 }
 
+// Words without OpName/OpString/OpLine, which only graphics debug dumps emit.
+size_t SpirvCodeWords(const std::vector<u32> &spirv) {
+  size_t words = spirv.size();
+  for (size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u) {
+    const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffffu);
+    if (opcode == spv::OpName || opcode == spv::OpString || opcode == spv::OpLine)
+      words -= spirv[offset] >> 16u;
+  }
+  return words;
+}
+
 void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   std::vector<u32> result_types(spirv[3]);
   for (size_t offset = 5; offset < spirv.size();) {
@@ -1679,6 +1690,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.stage = ShaderType::Compute;
   options.profile = test.profile;
   options.dump_ir = true;
+  options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -1750,7 +1762,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, *options.profile);
+        result.program, options.input_info, 0u, *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -1764,11 +1776,12 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ValidateSpirv(test.name, result.spirv);
   CheckSpirvEmission(test, result.spirv);
   if (test.max_spirv_words != 0u) {
-    Require(test.name, "emitted shader size", result.spirv.size() <= test.max_spirv_words,
-            "SPIR-V words=" + std::to_string(result.spirv.size()) +
+    const auto words = SpirvCodeWords(result.spirv);
+    Require(test.name, "emitted shader size", words <= test.max_spirv_words,
+            "SPIR-V words=" + std::to_string(words) +
                 ", limit=" + std::to_string(test.max_spirv_words));
     std::printf("[compute] %s wave=%u SPIR-V words=%zu\n", test.name,
-                result.program.wave_size, result.spirv.size());
+                result.program.wave_size, words);
   }
   if (test.expected_buffer_resources) {
     std::vector<u32> resources;
@@ -40649,7 +40662,7 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
                   compiled.program.info.samplers.size() == rows + 1u &&
                   tools.Disassemble(compiled.spirv, &text) &&
                   CountText(text, "OpImageSampleExplicitLod") == halves &&
-                  compiled.spirv.size() <= 8192u * halves,
+                  SpirvCodeWords(compiled.spirv) <= 8192u * halves,
               "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
     }
     if (large_samplers)
