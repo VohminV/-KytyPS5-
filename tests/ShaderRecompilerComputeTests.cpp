@@ -399,9 +399,9 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
-  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
-    executor.DrawIndex(0, command, args);
+    return executor.DrawIndex(0, command, args);
   }
 
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
@@ -18728,6 +18728,85 @@ public:
         }
       }
 
+      // Embedded fetches take indirect arguments from the GPU copy, whose vertex offset 7
+      // selects the covering triangle; the CPU backing holds zeros. Other vertex shaders read
+      // the arguments on the CPU.
+      {
+        constexpr uint64_t vertices_address = depth_address + 0x38000;
+        constexpr uint64_t args_address = vertices_address + 0x100;
+        std::array<float, 40> positions{};
+        constexpr std::array<float, 12> triangle{-1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1};
+        std::ranges::copy(triangle, positions.begin() + 28);
+        std::memcpy(reinterpret_cast<void *>(vertices_address), positions.data(),
+                    sizeof(positions));
+        const vk::DrawIndexedIndirectCommand args{3, 1, 0, 7, 5};
+        std::memcpy(reinterpret_cast<void *>(args_address), &args, sizeof(args));
+        // Larger than a caching page, so the arguments are cached instead of streamed.
+        (void)context.GetBufferCache().ObtainBuffer(
+            vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
+        const vk::DrawIndexedIndirectCommand zero_args{};
+        Require("GpuIndirectDraw", "CPU backing",
+                LibKernel::Memory::TryWriteBacking(args_address, &zero_args, sizeof(zero_args)),
+                "the CPU copy of the arguments could not be cleared");
+        static const auto fetch_vertex = [] {
+          std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                                EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                                EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                                EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12)};
+          code.insert(code.end(), std::ranges::find(native_vertex, EncodeExp0(0x20, 0xf)),
+                      native_vertex.end());
+          return code;
+        }();
+        static std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+            fetch_offsets;
+        fetch_offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        static ShaderUserData fetch_user_data{
+            .direct_resource_offset = fetch_offsets.data(),
+            .direct_resource_count = static_cast<uint16_t>(fetch_offsets.size())};
+        static ShaderSemantic semantic{.hardware_mapping = 9, .size_in_elements = 4};
+        static const uint32_t vertex_buffer[]{
+            static_cast<u32>(vertices_address),
+            static_cast<u32>(vertices_address >> 32u) | (16u << 16u), 10,
+            DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 12u)};
+        static const uint32_t attribute =
+            static_cast<u32>(Prospero::VertexAttribFormat::k32_32_32_32Float) << 5u;
+        const auto fetch_vs = reinterpret_cast<uint64_t>(fetch_vertex.data());
+        ShaderMapUserData(fetch_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &fetch_user_data,
+             .input_semantics = &semantic, .num_input_semantics = 1,
+             .code_size_bytes = static_cast<uint32_t>(fetch_vertex.size() * sizeof(u32))});
+        const uint64_t tables[]{reinterpret_cast<uint64_t>(vertex_buffer),
+                                reinterpret_cast<uint64_t>(&attribute)};
+        shaders.SetGsShaderResource2({.user_sgpr = 4});
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)),
+                                HW::UserSgprType::Unknown);
+        }
+        const DrawIndexArgs indirect{
+            .index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+            .index_type_and_size = 1, .indirect_args = args_address};
+        shaders.SetEsShaderBase(fetch_vs);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        Require("GpuIndirectDraw", "embedded fetch",
+                RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(), indirect),
+                "an embedded-fetch indirect draw fell back to CPU arguments");
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          Require("GpuIndirectDraw", "vertex offset",
+                  pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                  "the draw did not take its arguments, vertex offset included, from the GPU");
+        }
+        shaders.SetEsShaderBase(indirect_vs);
+        Require("GpuIndirectDraw", "CPU fallback",
+                !RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(), indirect),
+                "GPU-read arguments reached a shader without embedded fetch");
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -20762,6 +20841,7 @@ private:
             "vertex layer output is not supported");
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
+                                available_features.drawIndirectFirstInstance &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
@@ -20854,6 +20934,7 @@ private:
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
+    device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
