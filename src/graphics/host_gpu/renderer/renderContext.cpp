@@ -14,9 +14,10 @@ namespace Libs::Graphics {
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
+      m_pipeline_cache(graphics, &m_image_heap), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_image_heap(*this, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -67,6 +68,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			m_texture_cache.PrepareCpuWrite(fault_vaddr, fault_size);
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		};
 		if (m_gpu != nullptr && !m_gpu->IsStopping() &&
 		    !CommandScheduler::InDeferredOperation()) {
@@ -74,6 +76,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		} else {
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -87,6 +90,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
 }
 
@@ -123,6 +127,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

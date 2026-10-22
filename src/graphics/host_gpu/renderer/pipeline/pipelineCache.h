@@ -36,6 +36,10 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+namespace ShaderRecompiler::IR {
+class ImageHeapSource;
+} // namespace ShaderRecompiler::IR
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
@@ -111,7 +115,7 @@ struct ShaderProgram {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -121,6 +125,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    uses_image_heap       = false;
 	};
 
 	struct GraphicsPrograms {
