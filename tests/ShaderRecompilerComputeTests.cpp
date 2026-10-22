@@ -33145,7 +33145,7 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
   return cases;
 }
 
-std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
+std::vector<TestCase> BufferLoadFormatD16VectorCases() {
   using F = Prospero::BufferFormat;
   using O = ShaderOpcode;
   struct LoadCase {
@@ -33158,6 +33158,7 @@ std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
     u32 index = 0;
     bool active = true;
     bool overlap = false;
+    u32 opcode = 0x83u;
   };
   constexpr LoadCase inputs[] = {
       {"BufferLoadFormatD16XyzwFloat32", F::k32_32_32_32Float,
@@ -33187,7 +33188,26 @@ std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
       {"BufferLoadFormatD16XyzwOverlappingAddress", F::k32_32_32_32Float,
        {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u},
        {0x38003c00u, 0xc0000000u}, DstSel(4, 5, 6, 7), 16, 0, true, true},
+      {"BufferLoadFormatD16XyFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u},
+       {0x38003c00u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x81u},
+      {"BufferLoadFormatD16XyUintSaturates", F::k32_32UInt,
+       {0x10000u, 7u}, {0x0007ffffu, 0xbeef5678u}, DstSel(4, 5, 6, 7), 8, 0, true, false, 0x81u},
+      {"BufferLoadFormatD16XyzFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0xc0000000u, 0x3e800000u},
+       {0x38003c00u, 0xbeefc000u}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzSintSaturates", F::k32_32_32_32SInt,
+       {0xffff7fffu, 7u, 0x8000u, 0xffff8000u},
+       {0x00078000u, 0xbeef7fffu}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzOobOne", F::k32_32_32_32Float,
+       {}, {0x3c00u, 0xbeef3c00u}, DstSel(1, 4, 1, 4), 16, 1, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzZeroStrideFloatOne", F::k32_32_32_32Float,
+       {}, {0x3c003c00u, 0xbeef0000u}, DstSel(1, 1, 4, 1), 0, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzInactive", F::k32_32_32_32Float,
+       {}, {0xabcd1234u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, false, false, 0x82u},
   };
+  constexpr O formats[] = {O::BUFFER_LOAD_FORMAT_D16_XY, O::BUFFER_LOAD_FORMAT_D16_XYZ,
+                           O::BUFFER_LOAD_FORMAT_D16_XYZW};
   std::vector<TestCase> cases;
   for (const auto &input : inputs) {
     TestCase test;
@@ -33197,8 +33217,8 @@ std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
     AppendVMovLiteral(&test.code, 18, 0xcafef00du);
     AppendVMovU32(&test.code, 12, input.index);
     if (!input.active) test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
-    // Captured b21e373811f28e31 pc 0x1914: e20c2000 8001100c.
-    test.code.push_back(EncodeMubuf0(0x83u, 0, true, false));
+    // Captured XYZW b21e373811f28e31 pc 0x1914: e20c2000 8001100c.
+    test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false));
     test.code.push_back(EncodeMubuf1(16, 1, input.overlap ? 16 : 12));
     if (!input.active) {
       test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
@@ -33220,7 +33240,7 @@ std::vector<TestCase> BufferLoadFormatD16XyzwCases() {
     if (input.stride != 0 && input.active) {
       test.storage_buffer_ranges = {{0, input.stride}, {0, 32}};
     }
-    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_XYZW,
+    test.opcodes = {O::V_MOV_B32, formats[input.opcode - 0x81u],
                     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     cases.push_back(std::move(test));
   }
@@ -33264,12 +33284,23 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
        {0xff80ff7fu, 0x0080007fu}, {0x7f7f8080u}, 1, 0x87u},
       {"BufferStoreFormatD16XyzwUnorm8", F::k8_8_8_8UNorm,
        {0x3800c000u, 0x40003c00u}, {0xffff8000u}, 1, 0x87u},
+      {"BufferStoreFormatD16XyFloat32", F::k32_32Float,
+       {0x3800c000u}, {0xc0000000u, 0x3f000000u}, 2, 0x85u},
+      {"BufferStoreFormatD16XyUint16", F::k16_16UInt, {0xfffe0001u}, {0xfffe0001u}, 1, 0x85u},
+      {"BufferStoreFormatD16XyzFloat32", F::k32_32_32Float,
+       {0xc0003c00u, 0xdead3800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u}, 3, 0x86u},
+      {"BufferStoreFormatD16XyzZeroFillsW", F::k16_16_16_16Float,
+       {0xc0003c00u, 0xdead3800u}, {0xc0003c00u, 0x00003800u}, 2, 0x86u},
+      {"BufferStoreFormatD16XyzUint8", F::k8_8_8_8UInt,
+       {0x00020001u, 0xdead0003u}, {0x00030201u}, 1, 0x86u},
   };
+  constexpr O formats[] = {O::BUFFER_STORE_FORMAT_D16_X, O::BUFFER_STORE_FORMAT_D16_XY,
+                           O::BUFFER_STORE_FORMAT_D16_XYZ, O::BUFFER_STORE_FORMAT_D16_XYZW};
   std::vector<TestCase> cases;
   for (const auto &input : inputs)
   for (const u32 wave : {32u, 64u})
   for (u32 mask = 0; mask < (input.opcode == 0x27u ? 2u : 1u); ++mask) {
-    const bool wide = input.opcode == 0x87u;
+    const bool wide = input.opcode >= 0x85u;
     const bool high = input.opcode == 0x27u;
     const bool multi_lane = wide || high;
     const bool masked = wide || mask != 0;
@@ -33322,9 +33353,9 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
     test.user_data = MakeStructuredStorageBufferData(stride, multi_lane ? wave : 3u,
                                                     false, BufferFormat(input.format));
     test.has_user_data = true;
-    test.opcodes = {O::V_MOV_B32, high ? O::BUFFER_STORE_FORMAT_D16_HI_X :
-                                wide ? O::BUFFER_STORE_FORMAT_D16_XYZW :
-                                       O::BUFFER_STORE_FORMAT_D16_X, O::S_ENDPGM};
+    test.opcodes = {O::V_MOV_B32,
+                    high ? O::BUFFER_STORE_FORMAT_D16_HI_X : formats[input.opcode & 3u],
+                    O::S_ENDPGM};
     if (high) test.decoded_counts = {{"BUFFER_STORE_FORMAT_D16_HI_X", 3u}};
     cases.push_back(std::move(test));
   }
@@ -43379,7 +43410,7 @@ std::vector<TestCase> MakeCases() {
   for (auto &test : BufferLoadFormatD16XCases()) {
     cases.push_back(std::move(test));
   }
-  for (auto &test : BufferLoadFormatD16XyzwCases()) {
+  for (auto &test : BufferLoadFormatD16VectorCases()) {
     cases.push_back(std::move(test));
   }
   for (auto &test : BufferStoreFormatD16Cases()) {
@@ -49357,7 +49388,7 @@ int main(int argc, char **argv) {
     for (const auto &test : BufferLoadFormatD16XCases()) {
       RunCase(&vulkan, test);
     }
-    for (const auto &test : BufferLoadFormatD16XyzwCases()) {
+    for (const auto &test : BufferLoadFormatD16VectorCases()) {
       RunCase(&vulkan, test);
     }
     for (const auto &test : BufferStoreFormatD16Cases()) {

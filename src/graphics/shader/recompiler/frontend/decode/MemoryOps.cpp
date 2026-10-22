@@ -74,8 +74,12 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
     {0x72u, Opcode::BUFFER_GL1_INV, 0, 0},
     {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
     {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true, 2},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
     {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
 };
 

@@ -997,6 +997,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
@@ -1017,6 +1019,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
