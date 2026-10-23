@@ -428,9 +428,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		for (const auto index: view->pending) {
 			if (m_elements[index].refs == 0u) continue;
-			auto resource = IR::ImageHeapResource(view->profile, m_elements[index].kind);
-			resource.heap = true; // Resolves only mapped textures.
-			auto binding  = executor.ResolveTexture(resource, m_elements[index].value);
+			auto binding = executor.ResolveTexture(
+			    IR::ImageHeapResource(view->profile, m_elements[index].kind),
+			    m_elements[index].value);
 			if (binding.image_id) {
 				auto& image = textures.GetImage(binding.image_id);
 				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
