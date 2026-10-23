@@ -5365,6 +5365,61 @@ public:
                       descriptor(3, Format::k8_8_8_8UNorm),
               "a stale element's rescan took a kind its view's programs lack");
 
+      // Tables keep the descriptors of unmapped textures, which PS5 never samples. Their words
+      // stay null in every view, even when the memory is mapped again before the next draw,
+      // until one of their own words changes.
+      const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+      write(20, descriptor(20, Format::k8_8_8_8UNorm));
+      Require(name, "live texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "live image",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, filtered.slots[160])),
+              "a mapped texture was not resolved");
+      context.UnmapMemory(texture(20), 0x1000u);
+      context.MapMemory(texture(20), 0x1000u);
+      heap.BeginDraw();
+      Require(name, "dead in a new view",
+              acquire(sampled, table, 64u) && views.back()->slots[160] == 0u,
+              "a view created after the remap resolved a dead descriptor");
+      Require(name, "remapped texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "dead descriptor",
+              filtered.slots[160] == 0u && !textures.IsRegionRegistered(texture(20), 0x1000u),
+              "the descriptor of an unmapped texture was resolved again after a remap");
+      write(19, descriptor(19, Format::k8_8_8_8UNorm));
+      write(21, descriptor(21, Format::k8_8_8_8UNorm));
+      Require(name, "neighbour writes", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "dead reprobe", filtered.slots[160] == 0u,
+              "rescanning changed neighbours revived a dead descriptor");
+      write(24, descriptor(20, Format::k8_8_8_8UNorm));
+      Require(name, "republished texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "republished descriptor",
+              filtered.slots[160] == 0u && ImageHeapTestAccess::ImageOf(heap, filtered.slots[192]),
+              "the same descriptor in another word was not resolved");
+      write(20, descriptor(22, Format::k8_8_8_8UNorm));
+      Require(name, "rewritten word", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "rewritten descriptor",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, filtered.slots[160])),
+              "a new descriptor in a dead word was not resolved");
+      // A view that a skipped draw left acquired buries before its rescan.
+      Require(name, "skipped draw view", acquire(sampled), "the view was declined");
+      context.UnmapMemory(texture(22), 0x1000u);
+      context.MapMemory(texture(22), 0x1000u);
+      heap.BeginDraw();
+      draw();
+      Require(name, "dead after a skipped draw", filtered.slots[160] == 0u,
+              "the rescan of a view left acquired resolved a dead descriptor");
+      // A new descriptor over unmapped memory is never resolved.
+      context.UnmapMemory(texture(23), 0x1000u);
+      write(23, descriptor(23, Format::k8_8_8_8UNorm));
+      Require(name, "unmapped texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),
+              "a descriptor over unmapped memory was resolved");
+
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&

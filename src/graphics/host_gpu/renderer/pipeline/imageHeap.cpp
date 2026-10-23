@@ -131,6 +131,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		created->base  = request.base;
 		created->size  = size;
 		created->words.resize(size / 4u);
+		created->dead.resize(size / 4u);
 		created->dirty_pages.assign((Common::AlignUp(request.base + size, TRACKER_PAGE_SIZE) -
 		                             Common::AlignDown(request.base, TRACKER_PAGE_SIZE)) /
 		                                TRACKER_PAGE_SIZE,
@@ -278,7 +279,10 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 	std::copy_n(words.begin() + offset,
 	            std::min<size_t>(view.profile.r128 ? 4u : 8u, words.size() - offset),
 	            value.dwords.begin());
-	const auto kind = IR::ImageHeapKind(view.profile, value);
+	// A buried word stays null in every view until its descriptor changes.
+	auto& dead = view.memory.dead[offset];
+	if (dead != 0u && dead != DescriptorHash {}(value)) dead = 0u;
+	const auto kind = dead != 0u ? 0u : IR::ImageHeapKind(view.profile, value);
 	Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, value));
 }
 
@@ -286,6 +290,32 @@ void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	const auto previous = std::exchange(view.slots[slot], entry);
 	Release(view, previous);
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
+}
+
+void ImageHeap::Bury() {
+	if (m_unmapped.empty()) return;
+	for (const auto& memory: m_memories) {
+		for (const auto& view: memory->views) {
+			bool buried = false;
+			for (const auto& [value, index]: view->elements) {
+				const auto& binding = m_elements[index].binding;
+				if (binding.image_id && std::ranges::any_of(m_unmapped, [&](GuestRange range) {
+					    return ImageRangeOverlaps(binding.desc.info.data, range);
+				    })) {
+					m_elements[index].stale = buried = true;
+				}
+			}
+			if (!buried) continue;
+			for (uint64_t probe = 0; probe < view->count; ++probe) {
+				const auto  slot    = (view->first + probe * view->step) / 4u;
+				const auto& element = m_elements[view->slots[slot] & ElementMask];
+				if (!element.stale) continue;
+				memory->dead[slot] = DescriptorHash {}(element.value);
+				Assign(*view, slot, 0u);
+			}
+		}
+	}
+	m_unmapped.clear();
 }
 
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const DescriptorValue& value) {
@@ -398,9 +428,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		for (const auto index: view->pending) {
 			if (m_elements[index].refs == 0u) continue;
-			auto binding = executor.ResolveTexture(
-			    IR::ImageHeapResource(view->profile, m_elements[index].kind),
-			    m_elements[index].value);
+			auto resource = IR::ImageHeapResource(view->profile, m_elements[index].kind);
+			resource.heap = true; // Resolves only mapped textures.
+			auto binding  = executor.ResolveTexture(resource, m_elements[index].value);
 			if (binding.image_id) {
 				auto& image = textures.GetImage(binding.image_id);
 				image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
@@ -483,6 +513,12 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
+	// Descriptors of textures in the range stay null even once it is mapped again.
+	if (!m_unmapped.empty() && m_unmapped.back().End() == address) {
+		m_unmapped.back().size += size;
+	} else {
+		m_unmapped.push_back({address, size});
+	}
 	auto&           scheduler = m_context.GetCommandScheduler();
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {

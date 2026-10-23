@@ -33,7 +33,10 @@ public:
 	KYTY_CLASS_NO_COPY(ImageHeap);
 
 	// Starts a draw or dispatch, before its programs acquire views.
-	void BeginDraw() { ++m_draw; }
+	void BeginDraw() {
+		++m_draw;
+		Bury();
+	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
@@ -89,6 +92,7 @@ private:
 		uint64_t                           size = 0;
 		std::vector<uint32_t>              words;
 		std::vector<uint8_t>               dirty_pages; // Unwatched, so unread since a write.
+		std::vector<uint64_t>              dead;        // Per word, a buried descriptor's hash.
 		uint64_t                           draw = 0;    // Last draw that refreshed it.
 		std::vector<std::unique_ptr<View>> views;
 	};
@@ -101,6 +105,7 @@ private:
 	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
+	void     Bury();
 	uint32_t Intern(View& view, uint32_t kind, const DescriptorValue& value);
 	void     Release(View& view, uint32_t entry);
 	void     Unreference(Element& element);
@@ -120,6 +125,7 @@ private:
 	std::vector<std::pair<size_t, size_t>>    m_runs;
 	std::vector<uint32_t>                     m_scratch;
 	std::vector<uint32_t>                     m_writes; // Elements whose descriptors changed.
+	std::vector<GuestRange>                   m_unmapped; // Since the last Bury.
 	vk::DescriptorSetLayout                   m_layout = nullptr;
 	vk::DescriptorPool                        m_pool   = nullptr;
 	vk::DescriptorSet                         m_set    = nullptr;
