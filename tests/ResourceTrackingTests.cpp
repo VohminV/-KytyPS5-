@@ -550,7 +550,7 @@ void TestImageHeapKinds() {
   Check(resource.numeric_class == Libs::Graphics::Prospero::TextureNumericClass::Uint &&
             !resource.cube && cube_resource.cube &&
             cube_resource.numeric_class == Libs::Graphics::Prospero::TextureNumericClass::Float &&
-            resource.resource_class == ImageResourceClass::Sampled &&
+            resource.resource_class == ImageResourceClass::Sampled && resource.read &&
             ImageHeapResource(root, 0u) == ImageHeapResource(other, 0u),
         "heap kind resources lost their type or kept root identity");
   root.depth_compare = true;

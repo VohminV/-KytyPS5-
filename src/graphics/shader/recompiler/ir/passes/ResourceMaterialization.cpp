@@ -1882,6 +1882,7 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	ImageResource resource;
 	resource.resource_class         = ImageResourceClass::Sampled;
+	resource.read                   = true;
 	resource.heap                   = true;
 	resource.dimension              = root.dimension;
 	resource.unfiltered_access_only = root.unfiltered_access_only;
