@@ -60,6 +60,7 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
+#include "SrtWalkerTestMemory.h"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -1724,15 +1725,17 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
-      .read_memory = ReadTestMemory,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
       .workgroup_counts = workgroup_counts,
   };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
+  {
+    FakeGuestMemory fake(ReadTestMemory, runtime.userdata);
+    Require(test.name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(
+                resource_plan, runtime, resources, specialization),
+            "translated resources could not be materialized");
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -11304,7 +11307,7 @@ public:
               };
               const ShaderRecompiler::IR::SrtRuntime runtime{
                   .user_data = user_data, .shader_base = reinterpret_cast<uint64_t>(caller.data()),
-                  .read_memory = read, .read_specialization_memory = read};
+                  .read_specialization_memory = read};
               auto source = ShaderRecompiler::PrepareShaderSource(caller, options);
               auto translated = ShaderRecompiler::TranslateProgram(
                   ShaderRecompiler::RefreshShaderSource(source, runtime), options);
@@ -17227,12 +17230,7 @@ public:
       stencil_compute.stage.resources = &stencil_snapshot;
       Require(name, "stencil fill materialization",
           ShaderRecompiler::IR::MaterializeResources(stencil_plan,
-              {.user_data = stencil_userdata, .userdata = &stencil_byte,
-               .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
-                 if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
-                 words[0] = *static_cast<uint32_t *>(data);
-                 return true;
-               }}, stencil_snapshot, stencil_specialization),
+              {.user_data = stencil_userdata}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
       ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
@@ -39592,25 +39590,25 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   options.input_info.compute = &test.compute_info;
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto plan = ExtractResourcePlan(translated.program);
-  struct CountMemory { u32 value = 72; u32 reads = 0; bool clean = true; } memory;
-  SrtRuntime runtime{.user_data = test.user_data, .userdata = &memory};
+  struct CountMemory { u32 value = 72; u32 reads = 0; bool readable = true; } memory;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Require(test.name, "strict reader required",
-          !MaterializeResources(plan, runtime, snapshot, specialization),
-          "vector descriptor input bypassed the clean-memory reader");
-  runtime.read_specialization_memory = [](void *data, uint64_t address, std::span<u32> words) {
-    auto &memory = *static_cast<CountMemory *>(data);
-    ++memory.reads;
-    if (!memory.clean || address != count_address || words.size() != 1) return false;
-    words[0] = memory.value;
-    return true;
+  const auto materialize = [&] {
+    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<u32> words) {
+      auto &memory = *static_cast<CountMemory *>(data);
+      ++memory.reads;
+      if (!memory.readable || address != count_address) return false;
+      words[0] = memory.value;
+      return true;
+    }, &memory);
+    return MaterializeResources(plan, {.user_data = test.user_data}, snapshot, specialization);
   };
-  memory.clean = false;
-  Require(test.name, "dirty input rejected",
-          !MaterializeResources(plan, runtime, snapshot, specialization),
-          "GPU-dirty count was accepted for host descriptor evaluation");
-  memory.clean = true;
+  // An unreadable count reads as zero, which leaves no records.
+  memory.readable = false;
+  Require(test.name, "unreadable input",
+          materialize() && memory.reads == 1 && snapshot.buffers[2].dwords[2] == 0,
+          "unreadable count did not read as zero");
+  memory.readable = true;
   ResourceSpecialization initial_specialization;
   // Reuse the same resource plan and compiled shader as the count and coverage change.
   for (const u32 count : {0u, 72u, 512u, 8192u, 262144u}) {
@@ -39619,7 +39617,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
     const u32 chunk = count < 512 ? 64 : count < 8192 ? 128 : count < 262144 ? 256 : 512;
     const u32 records = (count + chunk - 1) / chunk;
     Require(test.name, "cached descriptor refresh",
-            MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 1 &&
+            materialize() && memory.reads == 1 &&
                 snapshot.buffers[2].dwords[2] == records &&
                 snapshot.specialization_reads ==
                     std::vector<std::pair<uint64_t, uint64_t>>{{count_address, 4}},
@@ -44667,7 +44665,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   compute.thread_ids_num = 1;
   compute.workgroup_register = 8;
   u32 scalar_clear = 0x40404040u;
-  bool clean_scalar = false;
 
   const auto Compile = [&](const std::vector<u32> &code) {
     ShaderRecompiler::CompileOptions options;
@@ -44685,13 +44682,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
     const ShaderRecompiler::IR::SrtRuntime runtime{
         .user_data = options.user_data,
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
-        .userdata = &scalar_clear,
-        .read_specialization_memory = clean_scalar
-            ? +[](void *data, uint64_t address, std::span<uint32_t> words) {
-                if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
-                words[0] = *static_cast<uint32_t *>(data);
-                return true;
-              } : nullptr,
     };
     Require("Ps5GameExampleImageClear", "resource materialization",
             ShaderRecompiler::IR::MaterializeResources(
@@ -44849,7 +44839,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   scalar_code.push_back(EncodeMubuf0(0x04u, 0, true, false));
   scalar_code.push_back(EncodeMubuf1(1, 0, 0));
   AppendEnd(&scalar_code);
-  clean_scalar = true;
+  // The scalar input is a walker load, so it needs no specialization memory reader.
   auto loaded = Compile(scalar_code);
   runtime_resources = loaded;
   Require("Ps5GameExampleImageClear", "scalar-loaded fill",
@@ -44857,12 +44847,6 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
           "GTA3's scalar input was confused with its destination");
-  clean_scalar = false;
-  runtime_resources = Compile(scalar_code);
-  Require("Ps5GameExampleImageClear", "unavailable clean scalar",
-          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
-                                    packed_clear, size),
-          "a scalar without a clean reader was replaced by a fill");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
@@ -47329,8 +47313,9 @@ void CheckImageSamplerSpecialization() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
-                             .userdata = &memory, .read_specialization_memory = ReadTestMemory};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ReadTestMemory};
+    FakeGuestMemory fake(ReadTestMemory, &memory);
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -47420,10 +47405,8 @@ void CheckResourcePlanHandoff() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data,
-                             .read_memory = ReadTestMemory,
-                             .userdata = &memory,
-                             .read_specialization_memory = ReadTestMemory};
+    const SrtRuntime runtime{.user_data = user_data};
+    FakeGuestMemory fake(ReadTestMemory, &memory);
     Require(name, "initial descriptors",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0x1000u,
