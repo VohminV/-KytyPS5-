@@ -1683,6 +1683,17 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// The plan a restarted game loads from the shader cache, which saves back to the same bytes.
+ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
+                                                      const ShaderRecompiler::IR::Program &program) {
+  using namespace ShaderRecompiler::IR;
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
+  ResourcePlan plan;
+  Require(name, "resource plan cache", LoadResourcePlan(bytes, plan) && SaveResourcePlan(plan) == bytes,
+          "resource plan did not round-trip through its cache bytes");
+  return plan;
+}
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1715,8 +1726,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};
@@ -1903,8 +1913,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -171,37 +172,6 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .device_clock_period_ps = graphics.device_clock_period_ps};
 }
 
-static_assert(sizeof(ShaderRecompiler::IR::ResourceSpecialization::Buffer) == 28 &&
-                  sizeof(ShaderRecompiler::IR::ResourceSpecialization::Image) == 36 &&
-                  sizeof(ShaderRecompiler::IR::ResourceSpecialization::Sampler) == 12,
-              "PackSpecialization must list every field");
-
-// Appends every field as one word, each list preceded by its size.
-void PackSpecialization(const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-                        std::vector<uint32_t>&                              words) {
-	const auto word = [](auto value) { return static_cast<uint32_t>(value); };
-	words.push_back(word(specialization.buffers.size()));
-	for (const auto& buffer: specialization.buffers) {
-		words.insert(words.end(), {buffer.packed_stride, word(buffer.descriptor_format),
-		                           buffer.descriptor_swizzle, word(buffer.zero_stride_oob),
-		                           word(buffer.scalar_empty), buffer.indirect_root,
-		                           buffer.indirect_mapping_offset, buffer.indirect_search_iterations});
-	}
-	words.push_back(word(specialization.images.size()));
-	for (const auto& image: specialization.images) {
-		words.insert(words.end(), {word(image.numeric_class), word(image.dimension), image.mip_count,
-		                           word(image.conversion_format), image.shader_swizzle,
-		                           image.indirect_root, image.indirect_mapping_offset,
-		                           image.indirect_search_iterations, word(image.cube),
-		                           word(image.fmask), word(image.heap)});
-	}
-	words.push_back(word(specialization.samplers.size()));
-	for (const auto& sampler: specialization.samplers) {
-		words.insert(words.end(), {sampler.indirect_root, sampler.indirect_mapping_offset,
-		                           sampler.indirect_search_iterations});
-	}
-}
-
 // Formats with a narrower host variant drop the components the shader does not read.
 vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
 	switch (format) {
@@ -329,15 +299,11 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	// The same inputs give the same module id across runs.
 	const auto function_code = program.FunctionCode();
-	std::vector<uint32_t> words {static_cast<uint32_t>(key.stage), static_cast<uint32_t>(key.hash),
-	                             static_cast<uint32_t>(key.hash >> 32u), key.user_data_count,
-	                             static_cast<uint32_t>(key.static_state.size())};
-	words.insert(words.end(), key.static_state.begin(), key.static_state.end());
-	words.push_back(info.bindings.push_data_start_dword);
-	words.push_back(static_cast<uint32_t>(function_code.size()));
-	words.insert(words.end(), function_code.begin(), function_code.end());
-	PackSpecialization(program.specialization, words);
-	const auto id = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+	ShaderRecompiler::IR::Writer inputs;
+	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
+	                            info.bindings.push_data_start_dword, program.specialization);
+	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
+	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
