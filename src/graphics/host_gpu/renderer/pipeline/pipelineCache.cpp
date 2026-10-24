@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -164,14 +165,6 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 	     shader_hash, messages.c_str());
 }
 
-ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
-	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
-	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
-	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
-	        .device_clock_period_ps = graphics.device_clock_period_ps};
-}
-
 // Formats with a narrower host variant drop the components the shader does not read.
 vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
 	switch (format) {
@@ -242,6 +235,26 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 }
 
 } // namespace
+
+ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	return {.maintenance8           = graphics.maintenance8_enabled,
+	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u,
+	        .device_clock_period_ps = graphics.device_clock_period_ps};
+}
+
+std::filesystem::path ShaderStorePath() {
+	if (KYTY_BUILD != KYTY_BUILD_RELEASE || !Config::ShaderCacheEnabled() ||
+	    Config::GraphicsDebugDumpEnabled()) {
+		return {};
+	}
+	const auto title_id = PipelineCacheTitleId();
+	if (title_id.empty()) {
+		return {};
+	}
+	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+}
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
@@ -332,6 +345,10 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	} else if (key.stage == ShaderType::Pixel &&
 	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
+	}
+	// Programs with GPU-selected calls depend on their callees' current code.
+	if (program.call_source == nullptr) {
+		StoreModule(key, program, module, result.spirv);
 	}
 	return module;
 }
@@ -444,11 +461,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
-                             ShaderRecompiler::IR::ImageHeapSource* image_heap)
+                             ShaderRecompiler::IR::ImageHeapSource* image_heap,
+                             const std::filesystem::path&           shader_store)
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	WarmUp(shader_store);
 	m_async_thread = std::thread([this] { AsyncPipelineLoop(); });
 }
 
@@ -701,6 +720,20 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		// Reflection decodes both programs; the key also covers the VGT fields in tess.
+		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
+		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
+		                                   sh.m_vgtTfParam};
+		const auto [layout, inserted] = m_tess_layouts.try_emplace(
+		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
+		if (inserted) {
+			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
+			                                              vertex_params[1].code, layout->second);
+			StoreLayout(layout->first, layout->second);
+		}
+		for (auto& stage: vertex_info) {
+			stage.tess = layout->second;
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
@@ -1070,6 +1103,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
+	StorePipeline(key);
 	CheckpointDriverCache();
 
 	return pipeline;

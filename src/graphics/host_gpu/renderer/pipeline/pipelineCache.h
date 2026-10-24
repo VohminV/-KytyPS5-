@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/file.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -42,6 +43,10 @@ struct TranslateResult;
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
 } // namespace ShaderRecompiler::IR
+
+namespace ShaderRecompiler::Spirv {
+struct Profile;
+} // namespace ShaderRecompiler::Spirv
 
 #pragma pack(push, 1)
 
@@ -148,7 +153,9 @@ struct DrawRenderState {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
+	// Without a shader store path nothing is kept across runs.
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
+	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -212,6 +219,8 @@ private:
 		std::array<const ShaderModule*, 4> stages {};
 	};
 
+	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
+
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
@@ -224,6 +233,9 @@ private:
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
+	// Appends records of everything first created; invalid without a shader store.
+	Common::File m_store;
 
 	std::mutex                                  m_driver_cache_mutex;
 	std::mutex                                  m_async_mutex;
@@ -246,7 +258,26 @@ private:
 	void CheckpointDriverCache();
 	void AsyncPipelineLoop();
 	Pipeline* TakeReadyGraphicsPipeline(const GraphicsPipelineKey& key);
+
+	// pipelineSerialization.cpp
+	void WarmUp(const std::filesystem::path& path);
+	bool LoadRecord(std::span<const uint8_t>& records, std::vector<GraphicsPipelineKey>& pipelines);
+	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
+	                 const std::vector<uint32_t>& spirv);
+	void StorePipeline(const GraphicsPipelineKey& key);
+	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
+	// Every module by id, with id 0 naming an absent stage.
+	[[nodiscard]] ModuleMap MapModules() const;
+	// False when a stage id of the key is not in `modules`.
+	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                            const ModuleMap& modules);
 };
+
+// The shader store of the running title; empty unless --shader-cache is on in a Release build
+// without debug dumps, which change the SPIR-V.
+std::filesystem::path ShaderStorePath();
+// Host capabilities that change the emitted SPIR-V.
+ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

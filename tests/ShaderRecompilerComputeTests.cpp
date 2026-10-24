@@ -588,19 +588,13 @@ struct PipelineCacheTestAccess {
   // Replaces each graphics pipeline whose stage ids name compiled modules with one created
   // from only its key and those modules. The GPU must be idle. Returns how many it replaced.
   static uint32_t RecreateGraphicsPipelines(PipelineCache &cache) {
-    std::unordered_map<uint64_t, const ShaderModule *> modules{{0, nullptr}}; // Id 0: absent.
-    for (const auto &program : cache.m_program_cache | std::views::values)
-      for (const auto &module : program.modules) modules.emplace(module.id, &module);
+    const auto modules = cache.MapModules();
     auto &device = cache.m_graphics.device;
     uint32_t count = 0;
     for (auto &[key, pipeline] : cache.m_graphics_pipelines) {
-      // Test-owned modules are not in the cache.
-      if (!std::ranges::all_of(key.stage_ids, [&](uint64_t id) { return modules.contains(id); }))
-        continue;
-      std::array<const ShaderModule *, 4> stages{};
-      for (size_t i = 0; i < stages.size(); i++) stages[i] = modules.at(key.stage_ids[i]);
       PipelineCache::Pipeline recreated;
-      CreatePipelineInternal(cache.m_graphics, recreated, key, stages, nullptr);
+      // Test-owned modules are not in the cache.
+      if (!cache.CreateGraphicsPipeline(recreated, key, modules)) continue;
       device.destroyPipeline(pipeline.pipeline, nullptr);
       device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
@@ -611,6 +605,17 @@ struct PipelineCacheTestAccess {
   }
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
+
+  static void StoreLayout(PipelineCache &cache, uint64_t key,
+                          const ShaderTessellationInputInfo &layout) {
+    cache.StoreLayout(key, layout);
+  }
+
+  static const auto &TessLayouts(const PipelineCache &cache) { return cache.m_tess_layouts; }
+
+  static std::array<size_t, 2> Pipelines(const PipelineCache &cache) {
+    return {cache.m_graphics_pipelines.size(), cache.m_compute_pipelines.size()};
+  }
 };
 
 namespace {
@@ -44769,6 +44774,163 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// With a shader store a restart compiles nothing and creates every pipeline before the first
+// lookup. A damaged record and everything after it are dropped; a stale store starts over.
+void CheckShaderStore(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderStore";
+  constexpr uintptr_t base = 0x0000000205000000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  constexpr u32 value = 0x2a;
+  std::vector<u32> compute;
+  AppendVMovU32(&compute, 1, value);
+  compute.insert(compute.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&compute);
+  std::vector<u32> vertex;
+  AppendVMovU32(&vertex, 0, 0);
+  AppendVMovLiteral(&vertex, 1, 0x3f800000u);
+  vertex.insert(vertex.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 0, 0, 1)});
+  AppendEnd(&vertex);
+  std::vector<u32> pixel;
+  AppendVMovLiteral(&pixel, 0, 0x3f800000u);
+  pixel.insert(pixel.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+  AppendEnd(&pixel);
+  static ShaderUserData vertex_user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type,
+                      ShaderUserData *user_data = nullptr) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = type, .user_data = user_data,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(compute, Prospero::ShaderBinaryType::kCs);
+  map(vertex, Prospero::ShaderBinaryType::kGs, &vertex_user_data);
+  map(pixel, Prospero::ShaderBinaryType::kPs);
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "output memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0,
+              &direct_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                       direct_offset, 0x10000) == 0,
+          "output allocation or mapping failed");
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_shader_store_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00000.shaders";
+
+  struct Session {
+    std::array<size_t, 2> prewarmed{}, pipelines{};
+    std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> compiled{};
+    u32 output = 0;
+    bool operator==(const Session &) const = default;
+  };
+  // Dispatches the compute program and creates the graphics pipeline.
+  const auto run = [&] {
+    std::memset(mapped, 0, allocation_size);
+    RenderContext context(vulkan.RuntimeContext(), store);
+    auto &pipelines = context.GetPipelineCache();
+    Session session{.prewarmed = PipelineCacheTestAccess::Pipelines(pipelines)};
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetViewportTransformControl(0x300);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(vertex.data()));
+      shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(pixel.data()));
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(compute.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      const ShaderBufferResource output{{static_cast<u32>(base), static_cast<u32>(base >> 32u),
+          4, DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+      for (u32 i = 0; i < 4; i++) shaders.SetCsUserSgpr(i, output.fields[i]);
+      context.MapMemory(base, allocation_size);
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      auto &scheduler = context.GetCommandScheduler();
+      DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+      pipelines.GetGraphicsPrograms(scheduler.Current(), state);
+      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state);
+      context.GetBufferCache().ReadMemory(base, sizeof(u32));
+      (void)LibKernel::Memory::TryReadBacking(base, &session.output, sizeof(u32));
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    session.compiled = PipelineCacheTestAccess::Compiled(pipelines);
+    session.pipelines = PipelineCacheTestAccess::Pipelines(pipelines);
+    return session;
+  };
+  const auto flip = [&](uint64_t offset) {
+    Common::File file(store, Common::File::Mode::ReadWrite);
+    uint8_t byte = 0;
+    file.Seek(offset);
+    file.Read(&byte, 1);
+    byte ^= 0xffu;
+    file.Seek(offset);
+    file.Write(&byte, 1);
+  };
+
+  const auto cold = run();
+  const auto size = std::filesystem::file_size(store);
+  Require(name, "cold start",
+          cold.output == value && cold.prewarmed == std::array<size_t, 2>{} &&
+              cold.pipelines == std::array<size_t, 2>{1, 1} &&
+              cold.compiled[static_cast<size_t>(ShaderType::Compute)] == 1,
+          "the first run did not create its store, dispatch or pipelines");
+  auto warm = cold;
+  warm.prewarmed = cold.pipelines;
+  warm.compiled = {};
+  Require(name, "warm restart", run() == warm && std::filesystem::file_size(store) == size,
+          "a restart compiled a module, created a pipeline late or rewrote the store");
+  std::filesystem::resize_file(store, size + 3);
+  Require(name, "torn tail", run() == warm && std::filesystem::file_size(store) == size,
+          "a torn last record was kept");
+  // The graphics pipeline's record is the last one.
+  auto lost_pipeline = warm;
+  lost_pipeline.prewarmed[0] = 0;
+  std::filesystem::resize_file(store, size - 3);
+  Require(name, "truncated record",
+          run() == lost_pipeline && std::filesystem::file_size(store) == size,
+          "a cut record was not dropped and appended again, or took earlier records along");
+  // Flips the top checksum byte, just before the last zstd frame's magic 0xfd2fb528.
+  std::vector<uint8_t> bytes(size);
+  Common::File(store, Common::File::Mode::Read).Read(bytes.data(), static_cast<u32>(size));
+  const std::array<uint8_t, 4> zstd_magic{0x28, 0xb5, 0x2f, 0xfd};
+  flip(std::ranges::find_end(bytes, zstd_magic).begin() - bytes.begin() - 1);
+  Require(name, "damaged record",
+          run() == lost_pipeline && std::filesystem::file_size(store) == size,
+          "a damaged record was loaded or not replaced");
+  flip(0);
+  Require(name, "stale store", run() == cold && std::filesystem::file_size(store) == size,
+          "a store with another header was reused instead of started over");
+  // Reflecting a layout decodes LS and HS, so a restart takes it from the store.
+  const ShaderTessellationInputInfo layout{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    PipelineCacheTestAccess::StoreLayout(context.GetPipelineCache(), 1, layout);
+  }
+  {
+    RenderContext context(vulkan.RuntimeContext(), store);
+    const auto &layouts = PipelineCacheTestAccess::TessLayouts(context.GetPipelineCache());
+    Require(name, "tessellation layout",
+            layouts.contains(1) && std::memcmp(&layouts.at(1), &layout, sizeof(layout)) == 0,
+            "a restart did not load the stored tessellation layout");
+  }
+  std::filesystem::remove_all(store.parent_path());
+  Require(name, "release",
+          LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+              LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+          "output memory release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -50395,6 +50557,11 @@ int main(int argc, char **argv) {
     CheckStableProgramIds(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
+    VulkanHarness vulkan;
+    CheckShaderStore(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -51562,6 +51729,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();

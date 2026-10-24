@@ -32,7 +32,8 @@ struct ShaderStageRuntime;
 
 class RenderContext {
 public:
-	explicit RenderContext(GraphicContext& graphics);
+	explicit RenderContext(GraphicContext&              graphics,
+	                       const std::filesystem::path& shader_store = ShaderStorePath());
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
