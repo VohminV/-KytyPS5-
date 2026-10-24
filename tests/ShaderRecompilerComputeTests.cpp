@@ -609,6 +609,8 @@ struct PipelineCacheTestAccess {
     }
     return count;
   }
+
+  static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 };
 
 namespace {
@@ -44717,6 +44719,12 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
     for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
+    // One compute module per case and nothing else.
+    auto expected = PipelineCacheTestAccess::Compiled(cache);
+    expected.fill(0);
+    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
+    Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
+            "the per-stage compile counts missed or added a module");
   }
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);

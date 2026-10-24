@@ -316,6 +316,16 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	EXIT_IF(module.module == nullptr);
+	m_compiled[static_cast<size_t>(key.stage)]++;
+	// Guest geometry shaders are compiled through the host mesh stage.
+	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
+	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
+	            m_compiled[static_cast<size_t>(ShaderType::Pixel)],
+	            m_compiled[static_cast<size_t>(ShaderType::Compute)],
+	            m_compiled[static_cast<size_t>(ShaderType::Mesh)],
+	            m_compiled[static_cast<size_t>(ShaderType::Local)],
+	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
+	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	// The inputs of these come from the stage's static key.
 	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
 		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
