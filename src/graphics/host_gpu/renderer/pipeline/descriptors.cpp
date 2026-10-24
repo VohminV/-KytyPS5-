@@ -672,9 +672,7 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
-		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
-			image->binding = {};
-		}
+		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
 	m_bound_images.clear();
 }
@@ -823,12 +821,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || !old_image->registered ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
+		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
+		if (!old_image.registered || old_image.binding.needs_rebind) {
+			old_image.binding = {};
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
@@ -882,12 +877,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || !old_image->registered ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
+		auto& old_image = cache.m_slot_images[target.image_id];
+		if (!old_image.registered || old_image.binding.needs_rebind) {
+			old_image.binding = {};
 			target.desc.view_info.base_level = target.guest_mip_level;
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);
