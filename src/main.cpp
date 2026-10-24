@@ -48,8 +48,15 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
-	::printf("  --screen-width <num>                 Window width. Default: 1920.\n");
-	::printf("  --screen-height <num>                Window height. Default: 1080.\n");
+	::printf(
+	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in
+"
+	    "                                       <dir>, or license only without <dir>. Repeatable.
+");
+	::printf("  --screen-width <num>                 Window width. Default: 1920.
+");
+	::printf("  --screen-height <num>                Window height. Default: 1080.
+");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
@@ -299,6 +306,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.addcont_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--addcont") {
+			auto entry = Common::ParseAddContent(value);
+			if (!entry) {
+				::printf("--addcont needs <16-character A-Z/0-9 label>[=<existing folder>]: %s\n",
+				         value.c_str());
+				return false;
+			}
+			options.addcont.push_back(std::move(*entry));
 		} else if (arg == "--screen-width") {
 			if (!ParseUint32(value, options.config.screen_width) ||
 			    options.config.screen_width == 0) {
