@@ -22,12 +22,18 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics {
 
 struct GraphicContext;
+struct ShaderParams;
 class CommandBuffer;
+
+namespace ShaderRecompiler {
+struct CompileOptions;
+struct TranslateResult;
+} // namespace ShaderRecompiler
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -102,7 +108,7 @@ struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 
-	explicit operator bool() const { return id != 0 && module != nullptr; }
+	explicit operator bool() const { return module != nullptr; }
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -149,7 +155,22 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
-	struct ProgramCache;
+	struct Module;
+	struct Program;
+
+	struct ProgramKey {
+		ShaderType            stage           = ShaderType::Unknown;
+		uint64_t              hash            = 0;
+		uint32_t              user_data_count = 0;
+		std::vector<uint32_t> static_state;
+
+		bool operator==(const ProgramKey&) const = default;
+	};
+
+	// Variants of one source share a bucket; ProgramKey equality compares the state.
+	struct ProgramKeyHash {
+		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
+	};
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -176,18 +197,10 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
-	struct AsyncGraphicsJob {
-		GraphicsPipelineKey                key;
-		std::array<ShaderVertexInputInfo, 3> vertex_info;
-		uint32_t                           vertex_count = 1;
-		bool                               ps_active    = false;
-		ShaderPixelInputInfo               ps_input_info;
-		GraphicsPrograms                   programs;
-		ShaderRecompiler::IR::ResourceSnapshot resources;
-	};
-
-	GraphicContext&               m_graphics;
-	std::unique_ptr<ProgramCache> m_program_cache;
+	GraphicContext&                        m_graphics;
+	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	std::unordered_map<ProgramKey, std::unique_ptr<Program>, ProgramKeyHash> m_program_cache;
+	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -195,16 +208,12 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 
-	std::mutex                                  m_driver_cache_mutex;
-	std::mutex                                  m_async_mutex;
-	std::condition_variable                     m_async_cv;
-	std::deque<AsyncGraphicsJob>                m_async_jobs;
-	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending;
-	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
-	                                            m_async_ready;
-	std::atomic_bool                            m_async_stop {false};
-	std::thread                                 m_async_thread;
-
+	template <typename InputInfo>
+	ShaderProgram GetProgram(const ShaderParams& params, InputInfo& input_info,
+	                         uint32_t& push_data_cursor);
+	Module& CompileModule(Program& program, const ProgramKey& key,
+	                      ShaderRecompiler::CompileOptions  options,
+	                      ShaderRecompiler::TranslateResult translated, uint32_t push_data_cursor);
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 	void AsyncPipelineLoop();

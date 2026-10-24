@@ -44641,6 +44641,55 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Module ids come from the module inputs, not from the order of compilation.
+void CheckStableProgramIds(VulkanHarness &vulkan) {
+  constexpr const char *name = "StableProgramIds";
+  const auto make_code = [](u32 value) {
+    std::vector<u32> code;
+    AppendVMovU32(&code, 1, value);
+    code.insert(code.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+    AppendEnd(&code);
+    return code;
+  };
+  const std::array codes{make_code(7), make_code(9)};
+  for (const auto &code : codes)
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  // The first two share code and differ only in the buffer stride specialization.
+  struct Case { u32 code, stride; };
+  constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
+  const auto compile = [&](PipelineCache &cache, const Case &test) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[test.code].data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    regs.cs_regs.user_sgpr = 4;
+    const ShaderBufferResource buffer{{0x10000u, test.stride << 16u, 64,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+    std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
+    ShaderComputeInputInfo input{};
+    return cache.GetComputeProgram(regs, input).id;
+  };
+  std::array<uint64_t, 3> forward{}, reverse{};
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
+  }
+  {
+    PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+    for (size_t i = cases.size(); i-- > 0;) reverse[i] = compile(cache, cases[i]);
+  }
+  Require(name, "order independence", forward == reverse,
+          "a program's module id depended on the order it was compiled in");
+  const std::set<uint64_t> ids(forward.begin(), forward.end());
+  Require(name, "distinct modules", ids.size() == forward.size(),
+          "different code or specialization shared a module id");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckPs5GameExampleImageClearRuntimeShape() {
   const auto MakeCode = [] {
     std::vector<u32> code;
@@ -50262,6 +50311,11 @@ int main(int argc, char **argv) {
     CheckComputeThreadDimensions(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--program-id-only") == 0) {
+    VulkanHarness vulkan;
+    CheckStableProgramIds(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
@@ -51426,6 +51480,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  CheckStableProgramIds(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullTextureDescriptors();
