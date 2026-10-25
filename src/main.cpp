@@ -49,14 +49,10 @@ static void PrintUsage() {
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf(
-	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in
-"
-	    "                                       <dir>, or license only without <dir>. Repeatable.
-");
-	::printf("  --screen-width <num>                 Window width. Default: 1920.
-");
-	::printf("  --screen-height <num>                Window height. Default: 1080.
-");
+	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
+	    "                                       <dir>, or license only without <dir>. Repeatable.\n");
+	::printf("  --screen-width <num>                 Window width. Default: 1920.\n");
+	::printf("  --screen-height <num>                Window height. Default: 1080.\n");
 	::printf(
 	    "  --user-name <name>                   Local user name (1-16 bytes). Default: Kyty.\n");
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
