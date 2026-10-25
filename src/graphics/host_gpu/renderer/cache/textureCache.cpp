@@ -1705,6 +1705,8 @@ void TextureCache::PrepareCpuWrite(uint64_t address, uint64_t size) {
 			(void)DownloadImageMemory(id, true);
 		}
 	}
+}
+
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
