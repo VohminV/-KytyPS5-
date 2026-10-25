@@ -141,7 +141,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
-	const auto&      program   = *runtime.program;
+	const auto&      program   = runtime.module->info;
 	const auto&      user_data = runtime.resources->user_data;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	for (const auto reg: program.info.dma_base_registers) {

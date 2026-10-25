@@ -34,19 +34,14 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
-namespace ShaderRecompiler::IR {
-struct CompiledShaderInfo;
-} // namespace ShaderRecompiler::IR
-
-struct ShaderProgram;
+struct ShaderModule;
 
 struct ShaderStageRuntime {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
-	const ShaderProgram*                            handle    = nullptr;
+	const ShaderModule*                           module    = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr && resources != nullptr;
+		return module != nullptr && resources != nullptr;
 	}
 };
 
