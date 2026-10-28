@@ -26,11 +26,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding : IR::StageInput {
+struct InputBinding: IR::StageInput {
 	uint32_t variable_id = 0;
 };
 
-struct OutputBinding : IR::StageOutput {
+struct OutputBinding: IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
 };
@@ -86,79 +86,80 @@ struct EmitterState {
 		}
 	}
 
-	Builder                                          builder;
-	IR::Program&                                     program;
-	ShaderStageInputInfo                             input_info;
+	Builder                                             builder;
+	IR::Program&                                        program;
+	ShaderStageInputInfo                                input_info;
 	const Profile&                                      profile;
-	uint32_t                                        debug_source = 0;
-	uint32_t                                        void_type = 0;
-	uint32_t                                        bool_type = 0;
-	uint32_t                                        u32_type = 0;
-	uint32_t                                        u64_type = 0;
-	uint32_t                                        i32_type = 0;
-	uint32_t                                        f32_type = 0;
-	uint32_t                                        f64_type = 0;
-	uint32_t                                        u32_pair_type = 0;
-	uint32_t                                        i32_pair_type = 0;
-	uint32_t                                        function_type = 0;
-	std::array<uint32_t, 3>                          bool_vector_types {};
-	std::array<uint32_t, 3>                          u32_vector_types {};
-	std::array<uint32_t, 3>                          i32_vector_types {};
-	std::array<uint32_t, 3>                          f32_vector_types {};
+	uint32_t                                            debug_source  = 0;
+	uint32_t                                            void_type     = 0;
+	uint32_t                                            bool_type     = 0;
+	uint32_t                                            u32_type      = 0;
+	uint32_t                                            u64_type      = 0;
+	uint32_t                                            i32_type      = 0;
+	uint32_t                                            f32_type      = 0;
+	uint32_t                                            f64_type      = 0;
+	uint32_t                                            u32_pair_type = 0;
+	uint32_t                                            i32_pair_type = 0;
+	uint32_t                                            function_type = 0;
+	std::array<uint32_t, 3>                             bool_vector_types {};
+	std::array<uint32_t, 3>                             u32_vector_types {};
+	std::array<uint32_t, 3>                             i32_vector_types {};
+	std::array<uint32_t, 3>                             f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
-	uint32_t                                         tess_inner_variable = 0;
+	uint32_t                                            tess_inner_variable = 0;
 
-	uint32_t                                         lane_count              = 1;
-	uint32_t                                         lane_half               = 0;
-	std::array<BufferDefinition, 4>                  storage_buffers {};
-	std::vector<uint32_t>                           memory_byte_offsets;
-	uint32_t                                         bda_pagetable_variable  = 0;
-	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
-	uint32_t                                         indirect_format_function = 0;
-	uint32_t                                         indirect_format_geometry_function = 0;
-	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;
-	uint32_t                                         bvh_intersect_function  = 0;
-	uint32_t                                         gds_variable            = 0;
-	uint32_t                                         gds_length              = 0;
-	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
-	uint32_t                                         flattened_srt_variable  = 0;
-	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
-	uint32_t                                         lds_base_dwords         = 0;
-	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         lds_u64_variable        = 0;
-	std::array<uint32_t, 2>                          scratch_variable {};
+	uint32_t                                    lane_count = 1;
+	uint32_t                                    lane_half  = 0;
+	std::array<BufferDefinition, 4>             storage_buffers {};
+	std::vector<uint32_t>                       memory_byte_offsets;
+	uint32_t                                    bda_pagetable_variable            = 0;
+	uint32_t                                    fault_buffer_variable             = 0;
+	uint32_t                                    bda_pointer_function              = 0;
+	uint32_t                                    indirect_format_function          = 0;
+	uint32_t                                    indirect_format_geometry_function = 0;
+	std::map<std::array<uint32_t, 3>, uint32_t> indirect_buffer_load_functions;
+	uint32_t                                    bvh_intersect_function       = 0;
+	uint32_t                                    gds_variable                 = 0;
+	uint32_t                                    gds_length                   = 0;
+	uint32_t                                    push_constant_variable       = 0;
+	uint32_t                                    shader_data_storage_variable = 0;
+	uint32_t                                    flattened_srt_variable       = 0;
+	spv::StorageClass                           lds_storage_class = spv::StorageClassFunction;
+	uint32_t                                    lds_base_dwords   = 0;
+	uint32_t                                    lds_variable      = 0;
+	uint32_t                                    lds_u64_variable  = 0;
+	std::array<uint32_t, 2>                     scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
-	uint32_t                   sampler_variable                      = 0;
-	uint32_t                   sampler_type                          = 0;
-	uint32_t                   sampler_pointer_type                  = 0;
-	uint32_t                   main_func                             = 0;
-	uint32_t                   mesh_guest_func                       = 0;
-	uint32_t                   mesh_allocation                       = 0;
-	uint32_t                   mesh_primitive_data                   = 0;
-	uint32_t                   mesh_primitives                       = 0;
-	uint32_t                   mesh_cull                             = 0;
-	uint32_t                   entry_label                           = 0;
-	uint32_t                   current_label                         = 0;
-	const IR::Block*           current_block                         = nullptr;
-	uint32_t                   pixel_valid_mask_variable             = 0;
-	uint32_t                   subgroup_local_invocation_id_variable = 0;
-	uint32_t                   per_vertex_variable                   = 0;
-	uint32_t                   point_size_variable                   = 0;
-	uint32_t                   clip_distance_variable                = 0;
-	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
-	uint32_t                   user_clip_planes                      = 0;
-	uint32_t                   cull_distance_variable                = 0;
-	uint32_t                   layer_variable                        = 0;
-	uint32_t                   viewport_index_variable               = 0;
-	uint32_t                   depth_variable                        = 0;
-	uint32_t                   object_primitive_id_variable          = 0;
-	uint32_t                   sample_mask_variable                  = 0;
-	std::vector<InputBinding>  inputs;
-	std::vector<OutputBinding> outputs;
-	std::vector<uint32_t>      interface_variables;
+	uint32_t                                           sampler_variable          = 0;
+	uint32_t                                           sampler_type              = 0;
+	uint32_t                                           sampler_pointer_type      = 0;
+	uint32_t                                           main_func                 = 0;
+	uint32_t                                           mesh_guest_func           = 0;
+	uint32_t                                           mesh_allocation           = 0;
+	uint32_t                                           mesh_primitive_data       = 0;
+	uint32_t                                           mesh_primitives           = 0;
+	uint32_t                                           mesh_cull                 = 0;
+	uint32_t                                           entry_label               = 0;
+	uint32_t                                           current_label             = 0;
+	const IR::Block*                                   current_block             = nullptr;
+	uint32_t                                           pixel_valid_mask_variable = 0;
+	uint32_t                                           subgroup_local_invocation_id_variable = 0;
+	uint32_t                                           per_vertex_variable                   = 0;
+	uint32_t                                           point_size_variable                   = 0;
+	uint32_t                                           clip_distance_variable                = 0;
+	uint32_t                                           invalid_position_clip_distance = UINT32_MAX;
+	uint32_t                                           user_clip_planes               = 0;
+	uint32_t                                           cull_distance_variable         = 0;
+	uint32_t                                           layer_variable                 = 0;
+	uint32_t                                           viewport_index_variable        = 0;
+	uint32_t                                           depth_variable                 = 0;
+	uint32_t                                           object_primitive_id_variable   = 0;
+	uint32_t                                           sample_mask_variable           = 0;
+	std::vector<InputBinding>                          inputs;
+	std::vector<OutputBinding>                         outputs;
+	std::vector<uint32_t>                              interface_variables;
+	std::vector<uint32_t>                              loop_guard_variables;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -303,7 +304,6 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
@@ -337,8 +337,7 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0,
-                          bool sampler_dynamic = false);
+                          uint32_t mip = 0, uint32_t array_index = 0, bool sampler_dynamic = false);
 
 // sample is 0 (no id) for single-sampled images.
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
@@ -417,7 +416,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
-void EnsureLdsStorage(EmitterState& state);
+void     EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
@@ -433,14 +432,14 @@ struct MemoryResourceAccess {
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
-uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
+uint32_t             EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        BufferDefinition& buffer,
-                                                        uint32_t array_index = 0);
+                                                        BufferDefinition&     buffer,
+                                                        uint32_t              array_index = 0);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
@@ -534,19 +533,19 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
-void DefineGetBdaPointer(EmitterState& state);
-void DefineIndirectBufferFormats(ValueEmitContext& ctx);
-void DefineIndirectBufferLoads(ValueEmitContext& ctx);
-void DefineBvhIntersect(EmitterState& state);
+void     DefineGetBdaPointer(EmitterState& state);
+void     DefineIndirectBufferFormats(ValueEmitContext& ctx);
+void     DefineIndirectBufferLoads(ValueEmitContext& ctx);
+void     DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
-                        uint32_t result_type, Fn&& emit) {
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count, uint32_t result_type,
+                     Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
 	EXIT_IF(count == 0u);
-	const auto merge_label = state.builder.AllocateId();
+	const auto            merge_label = state.builder.AllocateId();
 	std::vector<uint32_t> labels(count);
 	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
 	for (uint32_t item = 0; item < count; item++) {
@@ -601,7 +600,7 @@ uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, 
                                        uint32_t default_value, Fn&& fn) {
 	if (condition == ConstantBool(state, true)) return fn();
 	const auto then_label  = state.builder.AllocateId();
-	const auto header     = state.current_label;
+	const auto header      = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);

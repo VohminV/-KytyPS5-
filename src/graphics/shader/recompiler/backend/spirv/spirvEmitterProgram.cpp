@@ -1,11 +1,12 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -55,11 +56,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                      header_label       = 0;
-	uint32_t                                      select_label       = 0;
-	uint32_t                                      after_switch_label = 0;
-	uint32_t                                      continue_label     = 0;
-	uint32_t                                      merge_label        = 0;
+	uint32_t                                                     header_label       = 0;
+	uint32_t                                                     select_label       = 0;
+	uint32_t                                                     after_switch_label = 0;
+	uint32_t                                                     continue_label     = 0;
+	uint32_t                                                     merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -84,9 +85,10 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
-		auto& state = ctx.state;
-		const auto primitive = EmitGetBuiltin(
-		    ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)}, IR::Value {0u});
+		auto&      state = ctx.state;
+		const auto primitive =
+		    EmitGetBuiltin(ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)},
+		                   IR::Value {0u});
 		const auto object = EmitPushDataLoad(state, ConstantU32(state, 0));
 		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
 		                          EmitAddU32(state, object, primitive));
@@ -94,8 +96,145 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// Diagnostic runaway-loop guard (KYTY_LOOP_GUARD="<shader-hash>[:<list>]", optional
+// KYTY_LOOP_GUARD_LIMIT="<iterations>").  <list> is "all", a loop index, or a
+// comma-separated list of indices and "first-last" ranges.  When a translated loop spins
+// on corrupt guest data it locks the device (NVIDIA Xid 109), so the selected loop
+// headers are forced to leave the loop after a fixed trip count instead.
+struct LoopGuardConfig {
+	struct Range {
+		int64_t first = 0;
+		int64_t last  = 0;
+	};
+
+	bool               enabled = false;
+	uint64_t           hash    = 0;
+	std::vector<Range> ranges;
+	uint32_t           limit = 65536;
+
+	[[nodiscard]] bool Matches(size_t index) const {
+		if (ranges.empty()) {
+			return true;
+		}
+		for (const auto& range: ranges) {
+			if (static_cast<int64_t>(index) >= range.first &&
+			    static_cast<int64_t>(index) <= range.last) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+const LoopGuardConfig& GetLoopGuardConfig() {
+	static const LoopGuardConfig config = [] {
+		LoopGuardConfig result;
+		const char*     value = std::getenv("KYTY_LOOP_GUARD");
+		if (value == nullptr || *value == '\0') {
+			return result;
+		}
+		const std::string text  = value;
+		const auto        split = text.find(':');
+		result.hash             = std::strtoull(text.substr(0, split).c_str(), nullptr, 16);
+		result.enabled          = result.hash != 0;
+		if (split != std::string::npos) {
+			const std::string list = text.substr(split + 1);
+			size_t            pos  = 0;
+			while (pos <= list.size()) {
+				const auto comma = list.find(',', pos);
+				const auto token =
+				    list.substr(pos, comma == std::string::npos ? comma : comma - pos);
+				if (token == "all") {
+					result.ranges.clear();
+					break;
+				}
+				if (!token.empty()) {
+					const auto             dash = token.find('-');
+					LoopGuardConfig::Range range;
+					range.first = std::strtoll(token.substr(0, dash).c_str(), nullptr, 10);
+					range.last  = dash == std::string::npos
+					                  ? range.first
+					                  : std::strtoll(token.substr(dash + 1).c_str(), nullptr, 10);
+					result.ranges.push_back(range);
+				}
+				if (comma == std::string::npos) {
+					break;
+				}
+				pos = comma + 1;
+			}
+		}
+		if (const char* limit = std::getenv("KYTY_LOOP_GUARD_LIMIT"); limit != nullptr) {
+			const auto parsed = std::strtoul(limit, nullptr, 10);
+			if (parsed != 0) {
+				result.limit = static_cast<uint32_t>(parsed);
+			}
+		}
+		return result;
+	}();
+	return config;
+}
+
+size_t LoopHeaderIndex(const IR::Program& program, const IR::Block* block) {
+	size_t index = 0;
+	for (const auto* candidate: program.blocks) {
+		if (candidate == block) {
+			break;
+		}
+		if (candidate->terminator.loop_header) {
+			++index;
+		}
+	}
+	return index;
+}
+
+bool BlockStartsWithPhi(const IR::Block* block) {
+	const auto& insts = block->Instructions();
+	return !insts.empty() && insts.front().GetOpcode() == IR::ValueOpcode::Phi;
+}
+
+// Returns the guard predicate for a loop header that must be forced out of the loop,
+// or nullopt when the header is left untouched.  Only the branch condition changes:
+// the set of branch targets is preserved so SSA phi edges stay valid.
+std::optional<uint32_t> LoopGuardCondition(ValueEmitContext& ctx, const IR::Block* block) {
+	const auto& config = GetLoopGuardConfig();
+	const auto& term   = block->terminator;
+	if (!config.enabled || !term.loop_header || term.merge_block == nullptr) {
+		return std::nullopt;
+	}
+	if (term.kind != CFG::TerminatorKind::Branch &&
+	    term.kind != CFG::TerminatorKind::ConditionalBranch) {
+		return std::nullopt;
+	}
+	if (config.hash != ctx.state.program.shader_hash) {
+		return std::nullopt;
+	}
+	const auto index = LoopHeaderIndex(ctx.state.program, block);
+	if (!config.Matches(index)) {
+		return std::nullopt;
+	}
+	if (index >= ctx.state.loop_guard_variables.size()) {
+		return std::nullopt;
+	}
+	if (term.kind == CFG::TerminatorKind::Branch && term.true_block != term.merge_block &&
+	    BlockStartsWithPhi(term.merge_block)) {
+		return std::nullopt;
+	}
+	auto&      state    = ctx.state;
+	const auto variable = state.loop_guard_variables[index];
+	const auto counter  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), counter, variable);
+	const auto next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, counter, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, variable, next);
+	const auto allowed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allowed, next,
+	                          ConstantU32(state, config.limit));
+	return allowed;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
+	const auto  guard      = LoopGuardCondition(ctx, block);
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
 			const auto* merge = term.merge_block;
@@ -119,6 +258,11 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				return;
 			}
 			emit_merge();
+			if (guard.has_value() && target != term.merge_block) {
+				ctx.state.builder.AddFunction(spv::OpBranchConditional, *guard,
+				                              target->Definition(), term.merge_block->Definition());
+				return;
+			}
 			ctx.state.builder.AddFunction(spv::OpBranch, target->Definition());
 			return;
 		}
@@ -129,7 +273,23 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			if (guard.has_value()) {
+				if (term.merge_block == true_block) {
+					const auto fired = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), fired,
+					                              *guard);
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), guarded,
+					                              condition, fired);
+					condition = guarded;
+				} else {
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), guarded,
+					                              condition, *guard);
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -231,7 +391,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	using Op = IR::ValueOpcode;
+	using Op      = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupUMinU32 ||
@@ -333,7 +493,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto& program = ctx.state.program;
+	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -524,9 +684,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
 	                          HalfArg(inst, index, 0), physical_lane);
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
@@ -550,8 +710,7 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 	if (const auto id = inst.Definition(half); id != 0) {
 		if (id != value) {
-			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()),
-			                          id, value);
+			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()), id, value);
 		}
 		return id;
 	}
@@ -687,6 +846,34 @@ void EmitProgram(EmitterState& state) {
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.entry_label);
+	if (GetLoopGuardConfig().enabled && GetLoopGuardConfig().hash == program.shader_hash) {
+		size_t index = 0;
+		for (const auto* block: program.blocks) {
+			if (!block->terminator.loop_header) {
+				continue;
+			}
+			const auto counter = state.builder.AllocateId();
+			const auto name    = "loop_guard_" + std::to_string(index++);
+			state.builder.AddName(counter, name.c_str());
+			const auto block_pc = [](const IR::Block* target) {
+				return target != nullptr ? target->start_pc : 0u;
+			};
+			const auto& term = block->terminator;
+			std::printf("LoopGuard loop[%zu] pc=0x%08x..0x%08x true=0x%08x false=0x%08x "
+			            "cont=0x%08x merge=0x%08x\n",
+			            index - 1, block->start_pc, block->end_pc, block_pc(term.true_block),
+			            block_pc(term.false_block), block_pc(term.continue_block),
+			            block_pc(term.merge_block));
+			state.builder.AddFunction(spv::OpVariable,
+			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+			                          counter, spv::StorageClassFunction, ConstantU32(state, 0));
+			state.loop_guard_variables.push_back(counter);
+		}
+		const auto& guard = GetLoopGuardConfig();
+		std::printf("LoopGuard active: hash=0x%016llx loop_headers=%zu limit=%u\n",
+		            static_cast<unsigned long long>(program.shader_hash),
+		            state.loop_guard_variables.size(), guard.limit);
+	}
 	if (state.program.info.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
@@ -741,10 +928,12 @@ void EmitProgram(EmitterState& state) {
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
 		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
 		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+		const auto row =
+		    EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index =
+		    EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords =
+		    EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
