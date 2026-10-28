@@ -48,8 +48,9 @@ struct ControllerSettings {
 	QString color;
 	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
-	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
-	int     keyboard_player     = 0;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the
+	// keyboard.
+	int keyboard_player = 0;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
@@ -68,8 +69,8 @@ struct ControllerSettings {
 		};
 		speaker_volume      = read_percent("controller_speaker_volume", 50);
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
-		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
-		                         Config::MAX_PLAYERS);
+		keyboard_player =
+		    qBound(0, s->value("controller_keyboard_player", 0).toInt(), Config::MAX_PLAYERS);
 	}
 };
 
@@ -117,11 +118,11 @@ public:
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 
-	Resolution             screen_resolution           = Resolution::R1920X1080;
-	QString                user_name                   = "Kyty";
-	int                    user_id                     = Config::DEFAULT_USER_ID;
+	Resolution             screen_resolution = Resolution::R1920X1080;
+	QString                user_name         = "Kyty";
+	int                    user_id           = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
-	PresentMode            present_mode                = PresentMode::Mailbox;
+	PresentMode            present_mode                = PresentMode::Fifo;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
