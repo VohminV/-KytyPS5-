@@ -9,7 +9,9 @@
 
 #include <condition_variable>
 #include <mutex>
+
 #include <queue>
+
 #include <thread>
 #include <vector>
 
@@ -21,33 +23,37 @@ public:
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
-	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           BeginRendering(const RenderState& state);
-	void           EndRendering();
-	void           Flush();
-	void           Flush(SubmitInfo& submit);
-	void           FlushAndWait();
-	void           Finish();
-	CommandBuffer& BeginCommand();
-	uint64_t       Submit(SubmitInfo submit = {});
+	void Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void BeginRendering(const RenderState& state);
+	void EndRendering();
+	void Flush();
+	void Flush(SubmitInfo& submit);
+	void FlushAndWait();
+	// KYTY_GPU_STEP=<seconds>: print and wait after each recorded draw or dispatch, so a GPU
+	// stall can be attributed to the exact command that follows the last printed line.
+	void                      Step(const char* label);
+	[[nodiscard]] static bool StepActive();
+	void                      Finish();
+	CommandBuffer&            BeginCommand();
+	uint64_t                  Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
-	void                      Shutdown();
-	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
-	void                      DrainPriorityOperations();
-	void                      WaitPriorityOperations(uint64_t tick);
+	void Shutdown();
+	void Wait(uint64_t tick);
+	void PopPendingOperations();
+	void DrainPriorityOperations();
+	void WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
-	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
-	void                           CheckActive() const;
-	CommandBuffer&                 Current();
-	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
-	[[nodiscard]] bool             IsFree(uint64_t tick);
+	[[nodiscard]] bool     Active() const noexcept { return m_command.m_registers != nullptr; }
+	void                   CheckActive() const;
+	CommandBuffer&         Current();
+	[[nodiscard]] uint64_t CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	[[nodiscard]] bool     IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }

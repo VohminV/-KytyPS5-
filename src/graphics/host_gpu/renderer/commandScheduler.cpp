@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -180,6 +182,39 @@ void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
+}
+
+namespace {
+// KYTY_GPU_STEP=<seconds>: returns the elapsed time once stepping becomes active, or a
+// negative value while stepping is off.
+double StepElapsed() {
+	static const char* value = std::getenv("KYTY_GPU_STEP");
+	if (value == nullptr) {
+		return -1.0;
+	}
+	static const double delay = std::strtod(value, nullptr);
+	static const auto   start = std::chrono::steady_clock::now();
+	const double        elapsed =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	return elapsed >= delay ? elapsed : -1.0;
+}
+} // namespace
+
+void CommandScheduler::Step(const char* label) {
+	const double elapsed = StepElapsed();
+	if (elapsed < 0.0) {
+		return;
+	}
+	static uint64_t counter = 0;
+	++counter;
+	// Print before the wait: if the GPU never completes this batch, this is the last line seen.
+	std::printf("GPU step %" PRIu64 " t=%.1fs: %s\n", counter, elapsed, label);
+	std::fflush(stdout);
+	FlushAndWait();
+}
+
+bool CommandScheduler::StepActive() {
+	return StepElapsed() >= 0.0;
 }
 
 void CommandScheduler::Finish() {

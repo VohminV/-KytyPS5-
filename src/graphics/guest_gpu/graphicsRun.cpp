@@ -316,8 +316,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -529,9 +528,7 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlush();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
-			cp.PrepareCpuFlip(submission.flip_request_id);
-			break;
+		case SubmissionType::FlipPreparation: cp.PrepareCpuFlip(submission.flip_request_id); break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -718,15 +715,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -758,8 +753,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		if (log_count.fetch_add(1) < 128) {
 			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition,
-			     m_predicate_skip ? 1u : 0u, wait_op);
+			     reinterpret_cast<uint64_t>(address), value, condition, m_predicate_skip ? 1u : 0u,
+			     wait_op);
 		}
 	}
 }
@@ -794,8 +789,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 		if (location == Pm4::SH_NOP) {
 			return;
 		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
 		g_hw_sh_indirect_func[location](cp, location, value);
 	};
 	write(registers.vertex_offset, vertex_offset);
@@ -882,6 +876,13 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
+	if (CommandScheduler::StepActive()) {
+		std::printf("CP dispatch: groups=%ux%ux%u mode=0x%08" PRIx32 " cs=0x%016" PRIx64 "\n",
+		            thread_group_x, thread_group_y, thread_group_z, mode,
+		            m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::fflush(stdout);
+	}
+
 	uint32_t frame_num = 0;
 
 	{
@@ -905,12 +906,19 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
+		                                              thread_group_y, thread_group_z, mode,
+		                                              IsAsyncComputeQueue());
 	}
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
+	if (CommandScheduler::StepActive()) {
+		std::printf("CP dispatch-indirect: args=0x%016" PRIx64 " mode=0x%08" PRIx32
+		            " cs=0x%016" PRIx64 "\n",
+		            args_addr, mode, m_sh_ctx.GetCs().cs_regs.data_addr);
+		std::fflush(stdout);
+	}
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);
