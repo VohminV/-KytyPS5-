@@ -47,7 +47,8 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      ImageMemoryPlacement placement = ImageMemoryPlacement::DeviceLocal);
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
@@ -160,6 +161,8 @@ public:
 	// Feedback-loop copy: when the host lacks attachment feedback loop support, a copy of this
 	// depth image is maintained for shader sampling instead of sampling the attachment directly.
 	ImageId feedback_copy_id = {};
+	// The image was created with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT.
+	bool feedback_loop_usage = false;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.

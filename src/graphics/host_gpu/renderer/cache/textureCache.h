@@ -25,6 +25,7 @@ class Buffer;
 class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
+class GpuMemoryManager;
 class RenderExecutor;
 class TextureCache;
 struct TextureCacheTestAccess;
@@ -46,7 +47,7 @@ public:
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	             BufferCache& buffer_cache);
+	             GpuMemoryManager& memory_manager, BufferCache& buffer_cache);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -176,6 +177,7 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	GpuMemoryManager&                                 m_memory_manager;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;

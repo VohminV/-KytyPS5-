@@ -99,6 +99,9 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
+	::printf("  --keep-gpu-cache-on-reuse            Keep Vulkan caches across guest remaps "
+	         "(default).\n");
+	::printf("  --no-keep-gpu-cache-on-reuse         Drop caches whenever guest memory is unmapped.\n");
 	::printf(
 	    "  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on "
@@ -221,6 +224,8 @@ static constexpr Flag FLAGS[] = {
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
+    {"--keep-gpu-cache-on-reuse", &ConfigOptions::keep_gpu_cache_on_reuse},
+    {"--no-keep-gpu-cache-on-reuse", &ConfigOptions::keep_gpu_cache_on_reuse, false},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},

@@ -269,6 +269,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memory/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memory/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/*.cpp"
@@ -537,6 +539,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(guest_memory_registry_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryRegistryTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memory/guestMemory.cpp"
+)
+target_link_libraries(guest_memory_registry_tests common)
+target_include_directories(guest_memory_registry_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -720,12 +729,15 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --no-keep-gpu-cache-on-reuse)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_address_layout COMMAND $<TARGET_FILE:image_address_layout_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	add_test(NAME guest_memory_registry COMMAND $<TARGET_FILE:guest_memory_registry_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
@@ -819,6 +831,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
+		guest_memory_registry_tests
 		page_manager_tests
 		archive_file_tests
 		trophy_system_tests

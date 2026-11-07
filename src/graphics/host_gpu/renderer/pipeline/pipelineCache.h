@@ -81,7 +81,7 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
-	uint32_t                                             depth_stencil_feedback_loop = 0;
+	uint32_t                                             feedback_loop_aspects       = 0;
 
 	bool operator==(const PipelineRenderingState&) const = default;
 };
@@ -175,7 +175,7 @@ public:
 	                                      ShaderComputeInputInfo&      input_info);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              bool depth_stencil_feedback_loop = false);
+	                              vk::ImageAspectFlags feedback_loop_aspects = {});
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:

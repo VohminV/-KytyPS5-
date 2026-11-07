@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memory/gpuMemory.h"
 #include "graphics/host_gpu/memoryTuning.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -16,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -130,6 +132,21 @@ void BufferCache::ChangeRegister(BufferId id) {
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+		m_memory_manager.RegisterBuffer(buffer.CpuAddress(), buffer.Size(),
+		                                ResourcePlacement::DeviceLocal);
+		const auto placement =
+		    DescribeVulkanAllocation(m_graphics, buffer.Allocation());
+		m_memory_manager.RecordVulkanPlacement(buffer.CpuAddress(), buffer.Size(),
+		                                       placement);
+		ResourceCacheState state;
+		state.registered   = true;
+		state.gpu_modified = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(),
+		                                                           buffer.Size());
+		state.gpu_dirty = state.gpu_modified;
+		m_memory_manager.RecordCacheState(buffer.CpuAddress(), buffer.Size(), state);
+		m_memory_manager.RecordTrace(TraceEvent::Register, buffer.CpuAddress(), buffer.Size(),
+		                             placement.IsSystemMemory() ? "gtt-system" : "vram",
+		                             buffer.Size(), m_scheduler.CurrentTick());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -139,6 +156,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		m_memory_manager.UnregisterBuffer(buffer.CpuAddress(), buffer.Size());
 		buffer.is_deleted = true;
 	}
 }
@@ -183,6 +201,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
+	const auto readback_begin = std::chrono::steady_clock::now();
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -193,7 +212,17 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_download_buffer.Commit();
 	}
 	const auto& download = temporary ? *temporary : m_download_buffer;
+	const auto readback_wait_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - readback_begin)
+	        .count());
+	m_memory_manager.RecordDownload(GpuResourceType::Buffer, total_size, readback_wait_ns);
 	for (auto& copy: copies) {
+		m_memory_manager.MarkRangeDownloaded(buffer_address + copy.srcOffset, copy.size);
+		m_memory_manager.RecordTrace(TraceEvent::Download,
+		                             buffer_address + copy.srcOffset, copy.size,
+		                             "buffer-readback", copy.size,
+		                             m_scheduler.CurrentTick());
 		copy.dstOffset += offset;
 	}
 
@@ -244,7 +273,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                         PageManager& page_manager, TextureCache& texture_cache)
+                         PageManager& page_manager, GpuMemoryManager& memory_manager,
+                         TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
@@ -255,7 +285,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+      m_memory_manager(memory_manager), m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -268,36 +298,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
-	if (!m_graphics.CanReportMemoryUsage()) {
-		return;
-	}
-	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
-	const auto        budget_bytes     = m_graphics.GetTotalMemoryBudget();
-	const auto        budget =
-	    static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
-	const bool discrete = m_graphics.physical_device_properties.deviceType ==
-	                      vk::PhysicalDeviceType::eDiscreteGpu;
-	auto base = discrete ? m_graphics.GetDeviceLocalMemorySize() : budget_bytes;
-	if (base == 0) {
-		base = budget_bytes;
-	}
-	MemoryTuning::Watermarks watermarks;
-	if (MemoryTuning::GetWatermarks(base, budget_bytes, watermarks)) {
-		m_trigger_gc_memory  = watermarks.trigger;
-		m_critical_gc_memory = watermarks.critical;
-		std::fprintf(stderr,
-		             "[memory-tuning] buffer GC (%s): trigger=%llu MiB critical=%llu MiB\n",
-		             MemoryTuning::IsAutomaticLowVramProfile(base) ? "auto low-vram" : "env",
-		             static_cast<unsigned long long>(m_trigger_gc_memory / (1024ull * 1024ull)),
-		             static_cast<unsigned long long>(m_critical_gc_memory / (1024ull * 1024ull)));
-	} else {
-		const auto threshold = std::min(budget, target_threshold);
-		const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-		const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-		m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-		m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
-	}
+	const auto& watermarks = m_memory_manager.Budget().Snapshot().watermarks;
+	m_trigger_gc_memory    = watermarks.buffer_trigger;
+	m_critical_gc_memory   = watermarks.buffer_critical;
 }
 
 BufferCache::~BufferCache() {
@@ -318,9 +321,67 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	m_memory_manager.RecordTrace(TraceEvent::Invalidate, vaddr, size, "buffer-invalidate",
+	                             size, m_scheduler.CurrentTick());
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
+}
+
+void BufferCache::DiscardMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid discard range\n");
+	}
+	const auto end = vaddr + size;
+	std::vector<BufferId> discard;
+	auto                  it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr) {
+			discard.push_back(it->second);
+		}
+	}
+	for (const auto id: discard) {
+		auto& buffer = m_slot_buffers[id];
+		m_gpu_modified_ranges.Subtract(buffer.CpuAddress(), buffer.Size());
+		// The whole cached object is being dropped, so its tracker pages can no
+		// longer stay GPU-owned even when the discarded range covers only part
+		// of the buffer.
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		m_memory_manager.RecordEviction(GpuResourceType::Buffer, buffer.CpuAddress(),
+		                                buffer.Size(), buffer.Size());
+		DeleteBuffer(id);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
+	}
+	QueueBdaSync(vaddr, size);
+}
+
+void BufferCache::FlushGpuDirtyForSuspend(uint64_t vaddr, uint64_t size) {
+	const auto            end = vaddr + size;
+	std::vector<BufferId> flush;
+	auto                  it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr &&
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			flush.push_back(it->second);
+		}
+	}
+	// Publish every GPU-owned byte before the guest may remap the backing. A
+	// buffer straddling the suspended range is flushed whole: resuming the
+	// range may discard that buffer entirely, and dirty bytes outside the
+	// suspended range would otherwise be lost.
+	for (const auto id: flush) {
+		auto& buffer = m_slot_buffers[id];
+		ReadMemory(buffer.CpuAddress(), buffer.Size(), false);
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -500,6 +561,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
+	const auto upload_begin = std::chrono::steady_clock::now();
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		for (auto& copy: copies) {
@@ -510,6 +572,19 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			copy.srcOffset += base_offset;
 		}
 	});
+	const auto upload_wait_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - upload_begin)
+	        .count());
+	m_memory_manager.RecordUpload(GpuResourceType::Buffer, total_size, true, upload_wait_ns);
+	for (const auto& copy: copies) {
+		m_memory_manager.MarkRangeUploaded(buffer.CpuAddress() + copy.dstOffset, copy.size,
+		                                   copy.size);
+		m_memory_manager.RecordTrace(TraceEvent::Upload,
+		                             buffer.CpuAddress() + copy.dstOffset, copy.size,
+		                             "buffer-upload", copy.size,
+		                             m_scheduler.CurrentTick());
+	}
 	return source.first->Handle();
 }
 
@@ -544,7 +619,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		m_memory_manager.MarkGpuDirty(vaddr, size);
+		m_memory_manager.RecordTrace(TraceEvent::GpuWrite, vaddr, size, "buffer-write", size,
+		                             m_scheduler.CurrentTick());
 		ForgetColorMetadataChecks(vaddr, size);
+	} else {
+		m_memory_manager.RecordTrace(TraceEvent::GpuRead, vaddr, size, "buffer-read", size,
+		                             m_scheduler.CurrentTick());
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -712,6 +793,8 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
+			m_memory_manager.RecordEviction(GpuResourceType::Buffer, buffer.CpuAddress(),
+			                                buffer.Size(), buffer.Size());
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
@@ -734,6 +817,8 @@ void BufferCache::RunGarbageCollector() {
 		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
+		m_memory_manager.RecordEviction(GpuResourceType::Buffer, buffer.CpuAddress(), buffer.Size(),
+		                                buffer.Size());
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
 		m_slot_buffers.erase(id);

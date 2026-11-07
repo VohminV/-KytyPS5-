@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -435,6 +436,302 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
+static bool DrawLogTriggerPresent(const char* path) {
+	auto* file = std::fopen(path, "rb");
+	if (file == nullptr) {
+		return false;
+	}
+	std::fclose(file);
+	return true;
+}
+
+namespace {
+// Debug graphics control driven by a file (KYTY_DRAW_CTRL_FILE). Each line: "<mode> <value>",
+// mode: "max" — skip draws with a per-frame index greater than value; "snap" — after the draw
+// with that per-frame index, flush all commands and dump the window contents to a PPM file.
+// The file is re-read on every frame boundary.
+struct DrawControlResult {
+	bool    skip     = false;
+	bool    snapshot = false;
+	bool    dump_vertex = false;
+	uint32_t index    = 0;
+};
+
+DrawControlResult DrawControl(uint32_t frame, uint32_t index_count, uint32_t instance_count) {
+	static uint32_t        last_frame  = 0;
+	static uint32_t        per_frame   = 0;
+	static char            mode        = 0;
+	static int32_t         value       = -1;
+	static int32_t         value2      = -1;
+	static bool            initialized = false;
+	static bool            enabled     = false;
+	DrawControlResult      result;
+	if (!initialized) {
+		initialized = true;
+		enabled     = std::getenv("KYTY_DRAW_CTRL_FILE") != nullptr;
+	}
+	if (!enabled) {
+		return result;
+	}
+	if (frame != last_frame) {
+		last_frame = frame;
+		per_frame  = 0;
+		if (const char* env_file = std::getenv("KYTY_DRAW_CTRL_FILE"); env_file != nullptr) {
+			auto* f = std::fopen(env_file, "rb");
+			if (f != nullptr) {
+				char line[32] = {};
+				if (std::fgets(line, sizeof(line), f) != nullptr) {
+					char m = 0;
+					char v[24] = {};
+					if (std::sscanf(line, "%c %23s", &m, v) == 2) {
+						mode  = m;
+						value = static_cast<int32_t>(std::strtol(v, nullptr, 0));
+						value2 = -1;
+						if (const char* dash = std::strchr(v, '-');
+						    dash != nullptr && dash != v) {
+							value2 = static_cast<int32_t>(std::strtol(dash + 1, nullptr, 0));
+						}
+					}
+				}
+				std::fclose(f);
+			} else {
+				mode = 0;
+			}
+		}
+	}
+	const uint32_t index = per_frame++;
+	if (mode == 'm' && value >= 0 && index > static_cast<uint32_t>(value)) {
+		result.skip = true;
+	}
+	if (mode == 's' && value >= 0 && index == static_cast<uint32_t>(value)) {
+		result.snapshot = true;
+	}
+	// 'p' — draw only small particle batches (few indices, many instances), skip the rest.
+	if (mode == 'p' && !(index_count <= 64 && (instance_count > 1 || instance_count == 0))) {
+		result.skip = true;
+	}
+	// 'v' — dump the vertex fetch buffers of draws with per-frame index in [value,value2).
+	if (mode == 'v' && static_cast<int32_t>(index) >= value && static_cast<int32_t>(index) < value2) {
+		result.dump_vertex = true;
+	}
+	result.index = index;
+	return result;
+}
+
+void DumpVertexFetch(const ShaderVertexInputInfo& vs) {
+	std::fprintf(stderr, "[vb] bufs=%u fetch_embedded=%u fetch_external=%u\n",
+	             vs.buffers_num, vs.fetch_embedded ? 1u : 0u, vs.fetch_external ? 1u : 0u);
+	for (int i = 0; i < vs.buffers_num; i++) {
+		const auto& vb = vs.buffers[i];
+		std::fprintf(stderr, "[vb] buf%d addr=0x%08x%08x stride=%u records=%u fetch_index=%u\n", i,
+		             static_cast<uint32_t>(vb.addr >> 32), static_cast<uint32_t>(vb.addr),
+		             vb.stride, vb.num_records, vb.fetch_index);
+		if (vb.addr == 0) {
+			continue;
+		}
+		const uint64_t dump_bytes = std::min<uint64_t>(vb.stride ? vb.stride : 64u, 256u);
+		std::vector<uint8_t> data(dump_bytes);
+		if (LibKernel::Memory::TryReadBacking(vb.addr, data.data(), dump_bytes)) {
+			std::fprintf(stderr, "[vb] first %llu bytes:",
+			             static_cast<unsigned long long>(dump_bytes));
+			for (const auto value: data) {
+				std::fprintf(stderr, " %02x", value);
+			}
+			std::fprintf(stderr, "\n");
+			std::fprintf(stderr, "[vb] as floats:");
+			for (uint64_t o = 0; o + 4 <= dump_bytes; o += 4) {
+				float f;
+				std::memcpy(&f, data.data() + o, 4);
+				std::fprintf(stderr, " %.3g", static_cast<double>(f));
+			}
+			std::fprintf(stderr, "\n");
+		} else {
+			std::fprintf(stderr, "[vb] readback failed\n");
+		}
+	}
+}
+
+// Flush the pending commands (like CommandScheduler::Step but silent) and dump the current
+// window image to a PPM file using the X11 library already loaded by the presentation layer.
+void DumpWindowSnapshot(uint32_t frame, uint32_t index) {
+	auto module = ::dlopen("libX11.so.6", RTLD_NOW | RTLD_NOLOAD);
+	if (module == nullptr) {
+		module = ::dlopen("libX11.so.6", RTLD_NOW);
+	}
+	if (module == nullptr) {
+		std::fprintf(stderr, "[snap] libX11 not loadable\n");
+		return;
+	}
+	using XOpenDisplayFn      = void* (*)(const char*);
+	using XDefaultRootWindowFn = unsigned long (*)(void*);
+	using XGetImageFn         = void* (*)(void*, unsigned long, int, int, unsigned int,
+			                            unsigned int, unsigned long, int);
+	using XDestroyImageFn     = void (*)(void*);
+	using XGetPixelFn         = unsigned long (*)(void*, int, int);
+	auto* xopen = reinterpret_cast<XOpenDisplayFn>(::dlsym(module, "XOpenDisplay"));
+	auto* xroot = reinterpret_cast<XDefaultRootWindowFn>(::dlsym(module, "XDefaultRootWindow"));
+	auto* xget  = reinterpret_cast<XGetImageFn>(::dlsym(module, "XGetImage"));
+	auto* xfree = reinterpret_cast<XDestroyImageFn>(::dlsym(module, "XDestroyImage"));
+	auto* xpix  = reinterpret_cast<XGetPixelFn>(::dlsym(module, "XGetPixel"));
+	if (xopen == nullptr || xroot == nullptr || xget == nullptr || xfree == nullptr ||
+	    xpix == nullptr) {
+		std::fprintf(stderr, "[snap] X11 symbols unavailable\n");
+		return;
+	}
+	void* display = xopen(nullptr);
+	if (display == nullptr) {
+		return;
+	}
+	const auto root = xroot(display);
+	int          gx = 0, gy = 0;
+	unsigned int gw = 0, gh = 0, bw = 0, dep = 0;
+	unsigned long r = 0;
+	{
+		using XGetGeometryFn =
+		    int (*)(void*, unsigned long, unsigned long*, int*, int*, unsigned int*, unsigned int*,
+		            unsigned int*, unsigned int*);
+		auto* xgeom = reinterpret_cast<XGetGeometryFn>(::dlsym(module, "XGetGeometry"));
+		if (xgeom == nullptr || xgeom(display, root, &r, &gx, &gy, &gw, &gh, &bw, &dep) == 0) {
+			std::fprintf(stderr, "[snap] XGetGeometry failed\n");
+			return;
+		}
+	}
+	void* image = xget(display, root, 0, 0, gw, gh, ~0ul, 2 /*ZPixmap*/);
+	if (image == nullptr) {
+		std::fprintf(stderr, "[snap] XGetImage failed\n");
+		return;
+	}
+	char path[64];
+	std::snprintf(path, sizeof(path), "/tmp/opencode/snap_f%u_i%u.ppm", frame, index);
+	auto* out = std::fopen(path, "wb");
+	if (out == nullptr) {
+		xfree(image);
+		return;
+	}
+	std::fprintf(out, "P6\n%u %u\n255\n", gw, gh);
+	for (unsigned int y = 0; y < gh; y++) {
+		for (unsigned int x = 0; x < gw; x++) {
+			const auto p = xpix(image, static_cast<int>(x), static_cast<int>(y));
+			const unsigned char c[3] = {static_cast<unsigned char>(p >> 16),
+			                            static_cast<unsigned char>(p >> 8),
+			                            static_cast<unsigned char>(p)};
+			std::fwrite(c, 1, 3, out);
+		}
+	}
+	std::fclose(out);
+	xfree(image);
+	std::fprintf(stderr, "[snap] saved %s\n", path);
+}
+} // namespace
+
+static void LogDrawBindings(const DrawRenderState&             state,
+                             std::span<PreparedBindings* const> stages, uint32_t frame,
+                             uint32_t index_count, uint32_t instance_count,
+                             uint32_t first_instance) {
+	static FILE*          file          = nullptr;
+	static uint32_t       draw          = 0;
+	static uint32_t       max_draws     = 200000;
+	static uint32_t       trigger_check = 0;
+	static bool           enabled       = true;
+	static const char*    trigger_path  = nullptr;
+	static bool           initialized   = false;
+	if (!initialized) {
+		initialized  = true;
+		const auto* path = std::getenv("KYTY_DRAW_LOG");
+		if (path == nullptr) {
+			file = reinterpret_cast<FILE*>(~uintptr_t {0});
+		} else {
+			file = std::fopen(path, "w");
+			if (file != nullptr) {
+				std::setvbuf(file, nullptr, _IOLBF, 0);
+			} else {
+				file = reinterpret_cast<FILE*>(~uintptr_t {0});
+			}
+			if (const auto* max = std::getenv("KYTY_DRAW_LOG_MAX"); max != nullptr) {
+				max_draws = static_cast<uint32_t>(std::strtoul(max, nullptr, 0));
+			}
+			trigger_path = std::getenv("KYTY_DRAW_LOG_TRIGGER");
+			enabled      = trigger_path == nullptr;
+		}
+	}
+	if (file == reinterpret_cast<FILE*>(~uintptr_t {0})) {
+		return;
+	}
+	if (!enabled && (trigger_check++ & 63u) == 0 && DrawLogTriggerPresent(trigger_path)) {
+		enabled = true;
+	}
+	if (!enabled || draw >= max_draws) {
+		return;
+	}
+	const auto* vs_module = state.vertex_info[0].stage.module;
+	const auto* ps_module = state.ps_input_info.stage.module;
+	std::fprintf(file, "DRAW %u frame=%u colors=%u idx=%u inst=%u first=%u"
+	                   " vs=%016" PRIx64 "/%016" PRIx64 " ps=%016" PRIx64 "/%016" PRIx64 "\n",
+	             draw++, frame, state.color_count, index_count, instance_count, first_instance,
+	             vs_module != nullptr ? vs_module->id : 0,
+	             vs_module != nullptr ? vs_module->info.shader_hash : 0,
+	             ps_module != nullptr ? ps_module->id : 0,
+	             ps_module != nullptr ? ps_module->info.shader_hash : 0);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& info = state.color_info[i].desc.info;
+		const auto& view = state.color_info[i].desc.view_info;
+		std::fprintf(file, " C%u addr=0x%010" PRIx64 " ext=%ux%u fmt=%d gf=%d vf=%d samples=%u\n", i,
+		             info.data.address, info.extent.width, info.extent.height,
+		             static_cast<int>(info.pixel_format),
+		             static_cast<int>(info.guest_format), static_cast<int>(view.format),
+		             info.samples);
+	}
+	if (state.depth_info.image_id) {
+		const auto& info = state.depth_info.desc.info;
+		const auto& view = state.depth_info.desc.view_info;
+		std::fprintf(file, " D addr=0x%010" PRIx64 " ext=%ux%u fmt=%d gf=%d vf=%d samples=%u\n",
+		             info.data.address, info.extent.width, info.extent.height,
+		             static_cast<int>(info.pixel_format),
+		             static_cast<int>(info.guest_format), static_cast<int>(view.format),
+		             info.samples);
+	}
+	for (uint32_t stage = 0; stage < stages.size(); stage++) {
+		for (uint32_t i = 0; i < stages[stage]->images.size(); i++) {
+			const auto& image = stages[stage]->images[i];
+			const auto& info  = image.desc.info;
+			const auto& view  = image.desc.view_info;
+			std::fprintf(file,
+			             " S%u.%u addr=0x%010" PRIx64
+			             " ext=%ux%u fmt=%d gf=%d vf=%d type=%u mip=%u+%u layer=%u+%u\n",
+			             stage, i, info.data.address, info.extent.width, info.extent.height,
+			             static_cast<int>(info.pixel_format),
+			             static_cast<int>(info.guest_format), static_cast<int>(view.format),
+			             static_cast<uint32_t>(info.type), view.base_level, view.level_count,
+			             view.base_layer, view.layer_count);
+		}
+	}
+}
+
+static vk::ImageAspectFlags SampledImageAspects(TextureCache& cache, ImageId image_id,
+                                                const ImageViewInfo&              target,
+                                                std::span<PreparedBindings* const> stages) {
+	const auto&         image = cache.GetImage(image_id);
+	vk::ImageAspectFlags aspects;
+	for (const auto* stage: stages) {
+		for (const auto& binding: stage->images) {
+			if (binding.image_id != image_id ||
+			    binding.desc.type != TextureCache::BindingType::Texture) {
+				continue;
+			}
+			const auto native =
+			    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+			EXIT_IF(native == image.views.end());
+			if (ImageRangeOverlaps(target.base_level, target.level_count,
+			                       native->info.base_level, native->info.level_count) &&
+			    ImageRangeOverlaps(target.base_layer, target.layer_count,
+			                       native->info.base_layer, native->info.layer_count)) {
+				aspects |= native->info.aspect;
+			}
+		}
+	}
+	return aspects;
+}
+
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
@@ -467,9 +764,29 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
-		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
+		const auto& view             = target.desc.view_info;
+		const auto  sampled_aspects  = SampledImageAspects(cache, target.image_id, view, stages);
+		const bool  color_feedback =
+		    static_cast<bool>(sampled_aspects & vk::ImageAspectFlagBits::eColor);
+		if (color_feedback) {
+			feedback_aspects |= vk::ImageAspectFlagBits::eColor;
+		}
+		const auto layout =
+		    color_feedback
+		        ? (image.feedback_loop_usage
+		               ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+		               : vk::ImageLayout::eGeneral)
+		        : (image.binding.is_bound ? vk::ImageLayout::eGeneral
+		                                  : vk::ImageLayout::eColorAttachmentOptimal);
+		if (color_feedback && graphics_debug_dump_enabled()) {
+			static std::atomic_uint log_count = 0;
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 256) {
+				LOGF("ColorFeedback: target=0x%010" PRIx64 " usage=%d layout=%d extent=%ux%u\n",
+				     image.info.data.address, static_cast<int>(image.feedback_loop_usage),
+				     static_cast<int>(layout), image.info.extent.width,
+				     image.info.extent.height);
+			}
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
@@ -508,22 +825,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto& image = cache.GetImage(depth.image_id);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
-		const auto           draw_writes = depth.AttachmentWriteAspects();
-		vk::ImageAspectFlags sampled_aspects;
-		for (const auto* stage: stages) {
-			for (const auto& binding: stage->images) {
-				if (binding.image_id != depth.image_id ||
-				    binding.desc.type != TextureCache::BindingType::Texture)
-					continue;
-				const auto native =
-				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
-				EXIT_IF(native == image.views.end());
-				sampled_aspects |= native->info.aspect;
-				feedback_aspects |=
-				    DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info);
-			}
-		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		const auto draw_writes = depth.AttachmentWriteAspects();
+		const auto sampled_aspects =
+		    SampledImageAspects(cache, depth.image_id, depth.desc.view_info, stages);
+		feedback_aspects |= sampled_aspects & draw_writes;
+		const bool depth_feedback =
+		    static_cast<bool>(feedback_aspects &
+		                      (vk::ImageAspectFlagBits::eDepth |
+		                       vk::ImageAspectFlagBits::eStencil));
+		if (depth_feedback && !image.feedback_loop_usage) {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				std::printf("depth attachment feedback loop is not supported by the host\n");
@@ -531,7 +841,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
-			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
+			layout = image.feedback_loop_usage
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
@@ -1161,12 +1471,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	LogDrawBindings(state, stages, buffer.GetContext().GetGpu().GetFrameNum(), draw.index_count,
+	                draw.instance_count, draw.first_instance);
+	const auto draw_ctrl   = DrawControl(buffer.GetContext().GetGpu().GetFrameNum(),
+	                                     draw.index_count, draw.instance_count);
+	const bool bisect_skip = draw_ctrl.skip;
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (draw_ctrl.dump_vertex) {
+			std::fprintf(stderr, "[vb] draw pf=%u name=%s idx=%u inst=%u first=%u\n",
+			             draw_ctrl.index, draw.Name(), draw.index_count, draw.instance_count,
+			             draw.first_instance);
+			DumpVertexFetch(state.vertex_info[0]);
+		}
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1182,8 +1503,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                            state.depth_info, feedback_aspects, stages);
-	auto&      pipeline  = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    buffer, state, feedback_aspects != vk::ImageAspectFlags {});
+	auto&      pipeline =
+	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, feedback_aspects);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1260,17 +1581,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		if (!bisect_skip) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		}
 	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		if (!bisect_skip) {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
 	} else if (draw.IsIndexed()) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
+		if (!bisect_skip) {
+			vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                              emit.indirect.count, emit.indirect.stride);
+		}
 	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second, emit.indirect.count,
-		                       emit.indirect.stride);
+		if (!bisect_skip) {
+			vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                       emit.indirect.count, emit.indirect.stride);
+		}
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
+	if (draw_ctrl.snapshot) {
+		m_context.GetCommandScheduler().FlushAndWait();
+		m_context.GetCommandScheduler().PopPendingOperations();
+		DumpWindowSnapshot(buffer.GetContext().GetGpu().GetFrameNum(), draw_ctrl.index);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

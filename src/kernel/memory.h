@@ -65,6 +65,23 @@ struct VirtualQueryInfo {
 
 static_assert(sizeof(VirtualQueryInfo) == 72, "VirtualQueryInfo struct size is incorrect");
 
+// Lightweight backing identity used by the GPU memory manager. Unlike the
+// VirtualQuery ABI this carries no logging and returns the physical/backing
+// offset that aliases of the same guest allocation share.
+struct GuestBackingInfo {
+	uint64_t start          = 0;
+	uint64_t size           = 0;
+	uint64_t backing_offset = 0;
+	int32_t  memory_type    = 0;
+	uint32_t is_flexible    : 1;
+	uint32_t is_direct      : 1;
+	uint32_t is_pooled      : 1;
+	uint32_t is_committed   : 1;
+	char     name[KERNEL_MAXIMUM_NAME_LENGTH];
+};
+
+[[nodiscard]] bool GetGuestBackingInfo(uint64_t vaddr, uint64_t size, GuestBackingInfo& info);
+
 struct KernelBatchMapEntry {
 	void*         start;
 	uint64_t      offset;

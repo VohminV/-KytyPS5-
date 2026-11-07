@@ -24,7 +24,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		// Note that this must be set in a command buffer even if depth test is disabled.
 		cmdbuf.setDepthWriteEnable(depth_write_enabled);
 	}
-	if (depth_test_enabled && dirty_state.depth_compare_op) {
+	if (dirty_state.depth_compare_op) {
 		dirty_state.depth_compare_op = false;
 		cmdbuf.setDepthCompareOp(depth_compare_op);
 	}
@@ -34,7 +34,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
 #endif
 	}
-	if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
+	if (dirty_state.depth_bounds) {
 		dirty_state.depth_bounds = false;
 #if !defined(__APPLE__)
 		cmdbuf.setDepthBounds(depth_bounds_min, depth_bounds_max);
@@ -44,7 +44,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.depth_bias_enabled = false;
 		cmdbuf.setDepthBiasEnable(depth_bias_enabled);
 	}
-	if (depth_bias_enabled && dirty_state.depth_bias) {
+	if (dirty_state.depth_bias) {
 		dirty_state.depth_bias = false;
 		cmdbuf.setDepthBias(depth_bias_constant, depth_bias_clamp, depth_bias_slope);
 	}
@@ -52,7 +52,11 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.stencil_test_enabled = false;
 		cmdbuf.setStencilTestEnable(stencil_test_enabled);
 	}
-	if (stencil_test_enabled) {
+	if (stencil_test_enabled || dirty_state.stencil_front_ops ||
+	    dirty_state.stencil_back_ops || dirty_state.stencil_front_reference ||
+	    dirty_state.stencil_back_reference || dirty_state.stencil_front_write_mask ||
+	    dirty_state.stencil_back_write_mask || dirty_state.stencil_front_compare_mask ||
+	    dirty_state.stencil_back_compare_mask) {
 		if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
 		    stencil_front_ops == stencil_back_ops) {
 			dirty_state.stencil_front_ops = false;

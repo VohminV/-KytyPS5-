@@ -86,6 +86,7 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled      = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled               = false;
+	bool                   keep_gpu_cache_on_reuse         = true;
 	bool                   readback_linear_images          = false;
 	bool                   readback_tiled_images           = false;
 	bool                   sync_raw_image_buffers          = false;
@@ -152,6 +153,7 @@ bool SpirvDebugPrintfEnabled();
 bool GpuAssistedValidationEnabled();
 
 bool     RenderDocEnabled();
+bool     KeepGpuCacheOnReuseEnabled();
 bool     ReadbackLinearImagesEnabled();
 bool     ReadbackTiledImagesEnabled();
 bool     SyncRawImageBuffersEnabled();

@@ -1013,7 +1013,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		//   call <handler>
 		//   mov <reg>,rax
 		//   nop ...
-		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
+		const uint8_t tls_pattern[5]       = {0x64, 0x00, 0x8B, 0x00, 0x25};
 		const uint8_t zero_displacement[4] = {};
 
 		EXIT_IF(Jit::Call9::GetSize() != 9);
@@ -1033,13 +1033,16 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				break;
 			}
 
+			const uint8_t rex   = inst_ptr[1];
 			const uint8_t modrm = inst_ptr[3];
-			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
-			    inst_ptr[4] == tls_pattern[4] &&
+			const bool    rex_ok = (rex == 0x48 || rex == 0x4C);
+			if (inst_ptr[0] == tls_pattern[0] && rex_ok && inst_ptr[2] == 0x8Bu &&
+			    (modrm & 0xc7u) == 0x04u && inst_ptr[4] == tls_pattern[4] &&
 			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
 				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
 
-				const auto reg = (modrm >> 3u) & 7u;
+				const auto reg =
+				    static_cast<uint8_t>(((modrm >> 3u) & 7u) | ((rex & 0x04u) << 1u));
 				EXIT_NOT_IMPLEMENTED(reg == 4u);
 
 				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
@@ -1336,7 +1339,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
 		RunEntry(entry, params, ProgramExitHandler,
-		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
+		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x8000u));
 	}
 }
 
@@ -2174,7 +2177,7 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 
 	code->SetFunc(TlsMainGetAddr);
 
-	for (uint8_t reg = 1; reg < 8; reg++) {
+	for (uint8_t reg = 1; reg < 16; reg++) {
 		if (reg == 4) {
 			continue;
 		}

@@ -400,9 +400,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.layout                  = pipeline.pipeline_layout;
 	pipeline_info.basePipelineIndex       = -1;
 
-	if (rendering.depth_stencil_feedback_loop &&
-	    !graphics.attachment_feedback_loop_dynamic_state_enabled) {
+	const auto feedback_loop_aspects =
+	    static_cast<vk::ImageAspectFlags>(rendering.feedback_loop_aspects);
+	if (!graphics.attachment_feedback_loop_dynamic_state_enabled &&
+	    static_cast<bool>(feedback_loop_aspects &
+	                      (vk::ImageAspectFlagBits::eDepth |
+	                       vk::ImageAspectFlagBits::eStencil))) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
+	if (!graphics.attachment_feedback_loop_dynamic_state_enabled &&
+	    static_cast<bool>(feedback_loop_aspects & vk::ImageAspectFlagBits::eColor)) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eColorAttachmentFeedbackLoopEXT;
 	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);

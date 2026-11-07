@@ -24,6 +24,16 @@
 
 namespace Libs::Graphics {
 
+// Where a guest GPU resource physically lives on the host. Guest virtual
+// addresses never change with placement; only the Vulkan allocation does.
+enum class ImageMemoryPlacement : uint8_t {
+	// Hot resources: device-local VRAM (NVIDIA heap 0).
+	DeviceLocal,
+	// Diagnostic/experiment path: GPU-visible system memory (GTT, NVIDIA
+	// memory type 0 in the non-device-local heap).
+	GpuVisibleSystem,
+};
+
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);

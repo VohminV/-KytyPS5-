@@ -20,6 +20,11 @@ public:
 
 	[[nodiscard]] uint64_t GetPageSize() const;
 
+	// Restores host page protections from the live watcher state. Guest backing
+	// remaps drop the original mprotect() modes; retained GPU caches need the
+	// watchers to keep working after the range becomes visible again.
+	void ReapplyProtection(uint64_t vaddr, uint64_t size);
+
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>

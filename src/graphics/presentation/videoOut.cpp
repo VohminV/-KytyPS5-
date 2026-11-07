@@ -253,6 +253,7 @@ private:
 	bool                 m_processing      = false;
 	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
+	uint64_t             m_presented_frames = 0;
 };
 
 struct VideoOutDriver::Impl {
@@ -1294,6 +1295,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
+			m_presenter.Renderer().GetMemoryManager().OnFrameBoundary(++m_presented_frames);
 		}
 	}
 

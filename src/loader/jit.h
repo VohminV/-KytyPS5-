@@ -51,7 +51,10 @@ struct TlsRegStub {
 		*reinterpret_cast<uint32_t*>(&code[9]) = offset32;
 	}
 
-	void SetOutputReg(uint8_t reg) { code[15] = 0xc0u | (reg & 7u); }
+	void SetOutputReg(uint8_t reg) {
+		code[13] = reg >= 8 ? 0x49 : 0x48; // REX.W (+ REX.B for r8-r15)
+		code[15] = 0xc0u | (reg & 7u);
+	}
 
 	static uint64_t GetOffset(uint8_t reg) {
 		return 0x100 + static_cast<uint64_t>(reg) * GetSize();

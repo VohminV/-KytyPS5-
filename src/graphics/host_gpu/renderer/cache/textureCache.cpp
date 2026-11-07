@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memory/gpuMemory.h"
 #include "graphics/host_gpu/memoryTuning.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -122,46 +124,18 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                           PageManager& page_manager, BufferCache& buffer_cache)
+                           PageManager& page_manager, GpuMemoryManager& memory_manager,
+                           BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache),
+      m_buffer_cache(buffer_cache), m_memory_manager(memory_manager),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
-	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget_bytes = m_graphics.GetTotalMemoryBudget();
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(budget_bytes, INT64_MAX));
-		const bool discrete = m_graphics.physical_device_properties.deviceType ==
-		                      vk::PhysicalDeviceType::eDiscreteGpu;
-		auto base = discrete ? m_graphics.GetDeviceLocalMemorySize() : budget_bytes;
-		if (base == 0) {
-			base = budget_bytes;
-		}
-		MemoryTuning::Watermarks watermarks;
-		if (MemoryTuning::GetWatermarks(base, budget_bytes, watermarks)) {
-			m_trigger_gc_memory  = watermarks.trigger;
-			m_pressure_gc_memory = watermarks.pressure;
-			m_critical_gc_memory = watermarks.critical;
-			std::fprintf(stderr,
-			             "[memory-tuning] texture GC (%s): trigger=%llu MiB pressure=%llu MiB "
-			             "critical=%llu MiB\n",
-			             MemoryTuning::IsAutomaticLowVramProfile(base) ? "auto low-vram" : "env",
-			             static_cast<unsigned long long>(m_trigger_gc_memory / (1024ull * 1024ull)),
-			             static_cast<unsigned long long>(m_pressure_gc_memory / (1024ull * 1024ull)),
-			             static_cast<unsigned long long>(m_critical_gc_memory / (1024ull * 1024ull)));
-		} else {
-			const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-			m_pressure_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
-			    std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-			m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
-			    std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-			m_trigger_gc_memory =
-			    static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
-		}
-	}
+	const auto& watermarks = m_memory_manager.Budget().Snapshot().watermarks;
+	m_trigger_gc_memory    = watermarks.texture_trigger;
+	m_pressure_gc_memory   = watermarks.texture_pressure;
+	m_critical_gc_memory   = watermarks.texture_critical;
 }
 
 TextureCache::~TextureCache() {
@@ -227,7 +201,9 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	const auto placement =
+	    m_memory_manager.DecideImagePlacement(info.data.address, info.data.size);
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info, placement);
 	RegisterImage(id);
 	return id;
 }
@@ -247,6 +223,28 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	const auto type =
+	    image.info.IsDepth() ? GpuResourceType::DepthTarget : GpuResourceType::Texture;
+	m_memory_manager.RegisterImage(image.info.data.address, image.info.data.size, type,
+	                               image.info.IsTiled(), image.AccountedSize());
+	const auto placement =
+	    DescribeVulkanAllocation(m_graphics, image.backing.allocation);
+	m_memory_manager.RecordVulkanPlacement(image.info.data.address, image.info.data.size,
+	                                       placement);
+	ResourceCacheState state;
+	state.image_serial   = image.serial;
+	state.image_id       = id.index;
+	state.registered     = image.registered;
+	state.cpu_dirty      = image.IsCpuDirty();
+	state.gpu_dirty      = image.IsGpuModified();
+	state.gpu_modified   = image.IsGpuModified();
+	state.tracked        = image.IsTracked();
+	state.layout         = static_cast<uint64_t>(image.ReadLayout());
+	m_memory_manager.RecordCacheState(image.info.data.address, image.info.data.size, state);
+	m_memory_manager.RecordTrace(TraceEvent::Register, image.info.data.address,
+	                             image.info.data.size,
+	                             placement.IsSystemMemory() ? "gtt-system" : "vram",
+	                             image.AccountedSize(), m_scheduler.CurrentTick());
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -272,6 +270,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	m_memory_manager.UnregisterImage(image.info.data.address, image.info.data.size);
 	image.registered = false;
 }
 
@@ -979,6 +978,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+		const auto upload_type =
+		    binding == BindingType::RenderTarget
+		        ? GpuResourceType::RenderTarget
+		        : (binding == BindingType::VideoOut
+		               ? GpuResourceType::VideoOut
+		               : (binding == BindingType::Storage ? GpuResourceType::StorageImage
+		                                                  : GpuResourceType::Texture));
+		m_memory_manager.RecordUpload(upload_type, linear.size, true, 0);
+		m_memory_manager.RecordTrace(TraceEvent::Upload, image.info.data.address,
+		                             image.info.data.size, "linear", linear.size,
+		                             m_scheduler.CurrentTick());
 		return;
 	}
 
@@ -1025,6 +1035,12 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	}
 	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+	m_memory_manager.RecordUpload(image.depth_id ? GpuResourceType::DepthTarget
+	                                             : GpuResourceType::Texture,
+	                              linear.size, true, 0);
+	m_memory_manager.RecordTrace(TraceEvent::Upload, image.info.data.address,
+	                             image.info.data.size, "tiled", linear.size,
+	                             m_scheduler.CurrentTick());
 }
 
 void TextureCache::InitializeImage(ImageId id) {
@@ -1455,7 +1471,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	return image.FindView(desc.view_info);
+	const auto view = image.FindView(desc.view_info);
+	m_memory_manager.RecordDescriptorBinding(
+	    image.info.data.address, image.info.data.size, image.serial,
+	    reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)),
+	    static_cast<uint64_t>(image.ReadLayout()));
+	return view;
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
@@ -1473,7 +1494,12 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
-	return image.FindView(desc.view_info);
+	const auto view = image.FindView(desc.view_info);
+	m_memory_manager.RecordDescriptorBinding(
+	    image.info.data.address, image.info.data.size, image.serial,
+	    reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)),
+	    static_cast<uint64_t>(image.ReadLayout()));
+	return view;
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
@@ -1512,7 +1538,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
-	return image.FindView(desc.view_info);
+	const auto view = image.FindView(desc.view_info);
+	m_memory_manager.RecordDescriptorBinding(
+	    image.info.data.address, image.info.data.size, image.serial,
+	    reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)),
+	    static_cast<uint64_t>(image.ReadLayout()));
+	return view;
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
@@ -1539,6 +1570,10 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	m_memory_manager.MarkGpuDirty(image.info.data.address, image.info.data.size);
+	m_memory_manager.RecordTrace(TraceEvent::GpuWrite, image.info.data.address,
+	                             image.info.data.size, "commit",
+	                             image.info.data.size, m_scheduler.CurrentTick());
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1871,8 +1906,9 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool synchronous) {
 	if (synchronous && CommandScheduler::InDeferredOperation()) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto range          = image.info.data;
+	auto&      download       = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto readback_begin = std::chrono::steady_clock::now();
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	std::unique_ptr<Buffer> temporary;
@@ -1889,6 +1925,13 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool synchronous) {
 	} else {
 		download.Commit();
 	}
+	const auto readback_wait_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now() - readback_begin)
+	        .count());
+	m_memory_manager.RecordDownload(
+	    image.info.IsDepth() ? GpuResourceType::DepthTarget : GpuResourceType::Texture,
+	    range.size, readback_wait_ns);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -1913,13 +1956,16 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool synchronous) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	auto publish = [&download, range, mapped, offset, owner = std::move(temporary)] {
+	auto publish = [this, &download, range, mapped, offset, owner = std::move(temporary)] {
 		if (owner) {
 			owner->Invalidate(0, range.size);
 		} else {
 			download.Invalidate(offset, range.size);
 		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_memory_manager.MarkRangeDownloaded(range.address, range.size);
+		m_memory_manager.RecordTrace(TraceEvent::Download, range.address, range.size,
+		                             "texture-readback", range.size, m_scheduler.CurrentTick());
 	};
 	if (synchronous) {
 		const auto tick = m_scheduler.CurrentTick();
@@ -1936,6 +1982,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
+	m_memory_manager.MarkCpuDirty(address, size);
+	m_memory_manager.RecordTrace(TraceEvent::Invalidate, address, size, "gpu-write",
+	                             size, m_scheduler.CurrentTick());
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
@@ -1950,6 +1999,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
+	m_memory_manager.MarkCpuDirty(address, size);
+	m_memory_manager.RecordTrace(TraceEvent::Invalidate, address, size, "cpu-alias",
+	                             size, m_scheduler.CurrentTick());
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
@@ -2030,6 +2082,18 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		m_memory_manager.RecordEviction(
+		    owner->info.IsDepth() ? GpuResourceType::DepthTarget
+		                          : (owner->usage.render_target
+		                                 ? GpuResourceType::RenderTarget
+		                                 : (owner->usage.video_out ? GpuResourceType::VideoOut
+		                                                           : (owner->usage.storage
+		                                                                  ? GpuResourceType::StorageImage
+		                                                                  : GpuResourceType::Texture))),
+		    owner->info.data.address, owner->info.data.size, owner->AccountedSize());
+		m_memory_manager.RecordTrace(TraceEvent::Evict, owner->info.data.address,
+		                             owner->info.data.size, "unmap", owner->AccountedSize(),
+		                             m_scheduler.CurrentTick());
 		FreeImage(id);
 	}
 }
@@ -2082,6 +2146,15 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			m_memory_manager.RecordEviction(
+			    owner->info.IsDepth() ? GpuResourceType::DepthTarget
+			                          : (owner->usage.render_target
+			                                 ? GpuResourceType::RenderTarget
+			                                 : (owner->usage.video_out ? GpuResourceType::VideoOut
+			                                                           : (owner->usage.storage
+			                                                                  ? GpuResourceType::StorageImage
+			                                                                  : GpuResourceType::Texture))),
+			    owner->info.data.address, owner->info.data.size, owner->AccountedSize());
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {

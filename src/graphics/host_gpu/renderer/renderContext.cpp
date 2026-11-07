@@ -11,12 +11,19 @@
 
 namespace Libs::Graphics {
 
+namespace {
+constexpr size_t MAX_SUSPENDED_RANGES = 4096;
+}
+
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_memory_manager(graphics), m_render_executor(*this),
+      m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
-      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_memory_manager,
+                     m_texture_cache),
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_memory_manager,
+                      m_buffer_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
@@ -138,6 +145,156 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void RenderContext::SuspendMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		UnmapMemory(vaddr, size);
+		return;
+	}
+
+	// Make every GPU-owned byte visible to the guest before the remap, but keep
+	// the Vulkan objects resident.
+	m_buffer_cache.FlushGpuDirtyForSuspend(vaddr, size);
+
+	std::vector<SuspendedRange> retired;
+	{
+		std::lock_guard lock(m_suspended_mutex);
+		bool            merged = false;
+		for (auto it = m_suspended_ranges.begin(); it != m_suspended_ranges.end();) {
+			const bool overlaps = it->vaddr < vaddr + size && vaddr < it->vaddr + it->size;
+			if (!overlaps) {
+				++it;
+				continue;
+			}
+			const auto new_begin = std::min(vaddr, it->vaddr);
+			const auto new_end   = std::max(it->vaddr + it->size, vaddr + size);
+			vaddr                = new_begin;
+			size                 = new_end - new_begin;
+			it                   = m_suspended_ranges.erase(it);
+			merged               = true;
+		}
+		(void)merged;
+		m_suspended_ranges.push_back({vaddr, size});
+		while (m_suspended_ranges.size() > MAX_SUSPENDED_RANGES) {
+			retired.push_back(m_suspended_ranges.front());
+			m_suspended_ranges.erase(m_suspended_ranges.begin());
+		}
+	}
+	m_memory_manager.RecordSuspended(vaddr, size);
+	m_memory_manager.RecordTrace(TraceEvent::Suspend, vaddr, size, "guest-unmap", size, 0);
+	for (const auto& range: retired) {
+		CancelSuspendedMemory(range.vaddr, range.size);
+	}
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Subtract(vaddr, size);
+	}
+}
+
+void RenderContext::ResumeMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+
+	bool suspended = false;
+	{
+		std::lock_guard               lock(m_suspended_mutex);
+		std::vector<SuspendedRange> remaining;
+		remaining.reserve(m_suspended_ranges.size());
+		for (const auto& range: m_suspended_ranges) {
+			const bool overlaps =
+			    range.vaddr < vaddr + size && vaddr < range.vaddr + range.size;
+			if (!overlaps) {
+				remaining.push_back(range);
+				continue;
+			}
+			const auto range_end = range.vaddr + range.size;
+			if (range.vaddr < vaddr) {
+				remaining.push_back({range.vaddr, vaddr - range.vaddr});
+			}
+			if (range_end > vaddr + size) {
+				remaining.push_back({vaddr + size, range_end - (vaddr + size)});
+			}
+			suspended = true;
+		}
+		m_suspended_ranges.swap(remaining);
+	}
+	if (!suspended) {
+		MapMemory(vaddr, size);
+		return;
+	}
+
+	const bool reusable = m_memory_manager.OnResumeRange(vaddr, size);
+	if (reusable) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+	} else {
+		// The physical range was recycled while it was suspended. Drop cached
+		// Vulkan objects before the first draw of the new owner; never read the
+		// stale GPU contents back into the new allocation.
+		const auto discard = [this, vaddr, size] {
+			m_buffer_cache.DiscardMemory(vaddr, size);
+			m_texture_cache.UnmapMemory(vaddr, size);
+			m_image_heap.UnmapMemory(vaddr, size);
+		};
+		if (m_gpu == nullptr || m_gpu->IsStopping()) {
+			discard();
+		} else {
+			m_gpu->SendCommandSync(discard);
+		}
+	}
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+	}
+	m_buffer_cache.QueueBdaSync(vaddr, size);
+}
+
+void RenderContext::CancelSuspendedMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	std::vector<SuspendedRange> removed;
+	{
+		std::lock_guard lock(m_suspended_mutex);
+		for (auto it = m_suspended_ranges.begin(); it != m_suspended_ranges.end();) {
+			if (it->vaddr < vaddr + size && vaddr < it->vaddr + it->size) {
+				removed.push_back(*it);
+				it = m_suspended_ranges.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	for (const auto& range: removed) {
+		m_memory_manager.RecordTrace(TraceEvent::Evict, range.vaddr, range.size,
+		                             "suspend-expired", range.size, 0);
+		const auto discard = [this, &range] {
+			m_buffer_cache.DiscardMemory(range.vaddr, range.size);
+			m_texture_cache.UnmapMemory(range.vaddr, range.size);
+			m_image_heap.UnmapMemory(range.vaddr, range.size);
+		};
+		if (m_gpu == nullptr || m_gpu->IsStopping()) {
+			discard();
+		} else {
+			m_gpu->SendCommandSync(discard);
+		}
+	}
+}
+
+bool RenderContext::IsSuspended(uint64_t vaddr, uint64_t size) const {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	std::lock_guard lock(m_suspended_mutex);
+	return std::any_of(m_suspended_ranges.begin(), m_suspended_ranges.end(),
+	                   [vaddr, size](const SuspendedRange& range) {
+		                   return range.vaddr < vaddr + size &&
+		                          vaddr < range.vaddr + range.size;
+	                   });
 }
 
 void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {

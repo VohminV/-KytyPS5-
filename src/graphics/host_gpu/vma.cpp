@@ -167,7 +167,8 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 ImageMemoryPlacement placement) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
@@ -181,6 +182,50 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	    reinterpret_cast<const VkImageCreateInfo*>(&image_info);
 	VkImageCreateInfo create_info = *original_create_info;
 	LowVramDownscale::Apply(create_info);
+
+	if (placement == ImageMemoryPlacement::GpuVisibleSystem) {
+		// The controlled experiment must keep the guest VA and the image
+		// semantics identical, so only the allocation type changes. Ask the
+		// driver which memory types can back the image and drop the
+		// device-local ones: on NVIDIA the remaining type is the GTT/system
+		// heap that the GPU can read through the PCIe aperture.
+		VkImage          probe        = VK_NULL_HANDLE;
+		const auto       probe_result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImage(
+		    static_cast<VkDevice>(device), &create_info, nullptr, &probe);
+		if (probe_result == VK_SUCCESS) {
+			VkMemoryRequirements requirements {};
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkGetImageMemoryRequirements(
+			    static_cast<VkDevice>(device), probe, &requirements);
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage(static_cast<VkDevice>(device), probe,
+			                                             nullptr);
+			uint32_t system_bits = 0;
+			for (uint32_t type = 0; type < physical_device_memory_properties.memoryTypeCount;
+			     type++) {
+				const auto flags = physical_device_memory_properties.memoryTypes[type].propertyFlags;
+				if ((requirements.memoryTypeBits & (1u << type)) != 0 &&
+				    (flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ==
+				        vk::MemoryPropertyFlags {}) {
+					system_bits |= 1u << type;
+				}
+			}
+			if (system_bits != 0) {
+				alloc_info.requiredFlags  = 0;
+				alloc_info.memoryTypeBits = system_bits;
+				std::fprintf(stderr,
+				             "[placement] image 0x%" PRIx64 "x%ux%u format=%d forced to "
+				             "GPU-visible system memory (types=0x%x)\n",
+				             static_cast<uint64_t>(image_info.extent.width),
+				             image_info.extent.height, image_info.extent.depth,
+				             static_cast<int>(image_info.format), system_bits);
+			} else {
+				std::fprintf(stderr,
+				             "[placement] no system memory type supports image "
+				             "%ux%u format=%d; keeping VRAM\n",
+				             image_info.extent.width, image_info.extent.height,
+				             static_cast<int>(image_info.format));
+			}
+		}
+	}
 
 	const auto try_create = [&](VkImageCreateInfo& info) {
 		image.allocation = nullptr;

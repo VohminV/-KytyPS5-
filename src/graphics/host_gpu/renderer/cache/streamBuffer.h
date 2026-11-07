@@ -43,6 +43,7 @@ public:
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] VmaAllocation      Allocation() const noexcept { return m_allocation; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }

@@ -185,6 +185,10 @@ bool RenderDocEnabled() {
 	return g_config->renderdoc_enabled;
 }
 
+bool KeepGpuCacheOnReuseEnabled() {
+	return g_config->keep_gpu_cache_on_reuse;
+}
+
 bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }

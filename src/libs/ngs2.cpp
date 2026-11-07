@@ -634,6 +634,9 @@ struct Ngs2VoiceInternal {
 		frame_samples      = 0;
 		next_frame_samples = 0;
 		waveform_end       = nullptr;
+		if (decoder != nullptr) {
+			decoder->Reset();
+		}
 	}
 
 	void SetupSampler(const Ngs2WaveformFormat& format) {
@@ -687,7 +690,14 @@ struct Ngs2VoiceInternal {
 		if (count > capacity) {
 			return NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS;
 		}
-		EXIT_NOT_IMPLEMENTED(!accepts_blocks || (flags & ~0x17u) != 0);
+		const bool closed_without_clear = !accepts_blocks && (flags & 4u) == 0;
+		if ((flags & ~0x17u) != 0 || closed_without_clear) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "warning: NGS2 waveform blocks rejected (accepts_blocks=%u flags=0x%x count=%u "
+			    "capacity=%u)\n",
+			    accepts_blocks ? 1u : 0u, flags, count, capacity));
+			EXIT_NOT_IMPLEMENTED((flags & ~0x17u) != 0 || closed_without_clear);
+		}
 		const bool clear     = (flags & 4u) != 0;
 		const bool only_data = (flags & 2u) != 0;
 		const bool join      = only_data && (flags & 0x10u) == 0;
@@ -1663,7 +1673,30 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			}
 			continue;
 		}
-		EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
+		if (result.result != OK || result.input_consumed == 0) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "warning: NGS2 ATRAC9 decode failed (result=0x%08x consumed=%zu pending=%u "
+			    "compressed=%zu cursor=%zu data_size=%zu duration=%u frame_samples=%zu "
+			    "decoded_samples=%" PRIu64 " channels=%u sample_rate=%u); dropping block\n",
+			    static_cast<uint32_t>(result.result), result.input_consumed,
+			    pending ? 1u : 0u, voice.compressed_input.size(), block.data_cursor,
+			    block.info.data_size, voice.duration_remaining,
+			    voice.frame_samples, voice.decoded_samples, voice.channels, voice.sample_rate));
+			// A malformed frame must not take the whole voice, and through it the
+			// game, down with it. Drop the remainder of this block and let the
+			// decoder resynchronize on the next one.
+			voice.compressed_input.clear();
+			block.data_cursor        = block.info.data_size;
+			block.info.num_repeats   = 0;
+			voice.duration_remaining = 0;
+			if (voice.decoder != nullptr) {
+				voice.decoder->Reset();
+			}
+			if (!Ngs2FinishBlock(voice)) {
+				return false;
+			}
+			continue;
+		}
 		if (pending) {
 			voice.compressed_input.erase(voice.compressed_input.begin(),
 			                             voice.compressed_input.begin() + result.input_consumed);
@@ -2021,6 +2054,7 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 
 	const uint8_t* format           = nullptr;
 	const uint8_t* fact             = nullptr;
+	const uint8_t* smpl             = nullptr;
 	size_t         waveform_offset  = 0;
 	uint32_t       waveform_size    = 0;
 
@@ -2044,6 +2078,10 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 				return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 			}
 			fact = bytes + payload;
+		} else if (Ngs2FourCcEquals(chunk, "smpl")) {
+			if (chunk_size >= 60 && Ngs2ReadLe32(bytes + payload + 28) != 0) {
+				smpl = bytes + payload;
+			}
 		} else if (is_data) {
 			if (payload > std::numeric_limits<uint32_t>::max()) {
 				return NGS2_ERROR_INVALID_WAVEFORM_DATA;
@@ -2096,6 +2134,14 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	info->audio_frame_size         = static_cast<uint32_t>(codec.superframeSize);
 	info->num_audio_frame_samples  = static_cast<uint32_t>(frame_samples);
 	info->num_delay_samples        = Ngs2ReadLe32(fact + 4);
+	if (smpl != nullptr) {
+		info->loop_begin_position = Ngs2ReadLe32(smpl + 44);
+		info->loop_end_position   = Ngs2ReadLe32(smpl + 48);
+	}
+	if (info->loop_begin_position == 0 && info->loop_end_position == 0 &&
+	    info->num_samples != 0) {
+		info->loop_end_position = info->num_samples - 1;
+	}
 	info->num_blocks               = 1;
 	info->blocks[0].data_offset    = waveform_offset;
 	info->blocks[0].data_size      = waveform_size;
@@ -2529,6 +2575,17 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						const float clamped_ratio = std::clamp(ratio, 0.0f, 4.0f);
 						voice->sample_step = static_cast<uint64_t>(std::llround(
 							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
+						break;
+					}
+					case 8: {
+						std::string hex;
+						const auto* raw = reinterpret_cast<const uint8_t*>(param);
+						for (uint16_t i = 0; i < param->size && i < 64; i++) {
+							hex += fmt::sprintf("%02x", raw[i]);
+						}
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 sampler control 8 ignored (size=%u, bytes=%s)\n",
+						    param->size, hex));
 						break;
 					}
 					case 0xa: {

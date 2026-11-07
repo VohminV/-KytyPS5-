@@ -22,6 +22,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class GpuMemoryManager;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -48,11 +49,13 @@ public:
 	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache);
+	            GpuMemoryManager& memory_manager, TextureCache& texture_cache);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                   DiscardMemory(uint64_t vaddr, uint64_t size);
+	void                   FlushGpuDirtyForSuspend(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -147,6 +150,7 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	GpuMemoryManager&                                 m_memory_manager;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

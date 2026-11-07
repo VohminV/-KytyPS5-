@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/memory/gpuMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -18,6 +19,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <vector>
 
@@ -45,6 +47,7 @@ public:
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
+	GpuMemoryManager&   GetMemoryManager() { return m_memory_manager; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
 	ImageHeap&          GetImageHeap() { return m_image_heap; }
@@ -60,6 +63,13 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
+	// Retain GPU resources across a guest backing remap. The range is suspended
+	// without dropping Vulkan objects; ResumeMemory revalidates the backing
+	// generation and falls back to a full invalidate when the guest reused it.
+	void SuspendMemory(uint64_t vaddr, uint64_t size);
+	void ResumeMemory(uint64_t vaddr, uint64_t size);
+	void CancelSuspendedMemory(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsSuspended(uint64_t vaddr, uint64_t size) const;
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
@@ -74,6 +84,7 @@ private:
 	};
 
 	GraphicContext&           m_graphics;
+	GpuMemoryManager          m_memory_manager;
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
@@ -94,6 +105,12 @@ private:
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
+	struct SuspendedRange {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+	};
+	mutable std::mutex          m_suspended_mutex;
+	std::vector<SuspendedRange> m_suspended_ranges;
 };
 
 } // namespace Libs::Graphics

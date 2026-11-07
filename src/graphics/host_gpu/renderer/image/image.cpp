@@ -53,6 +53,18 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
 }
 
+[[nodiscard]] vk::ImageUsageFlags AddFeedbackLoopUsage(GraphicContext&        graphics,
+                                                       vk::ImageUsageFlags usage) {
+	const auto attachment = vk::ImageUsageFlagBits::eColorAttachment |
+	                        vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	if (graphics.attachment_feedback_loop_enabled &&
+	    static_cast<bool>(usage & vk::ImageUsageFlagBits::eSampled) &&
+	    static_cast<bool>(usage & attachment)) {
+		usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+	}
+	return usage;
+}
+
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
@@ -82,10 +94,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
-			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
-		}
-		return usage;
+		return AddFeedbackLoopUsage(graphics, usage);
 	}
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
@@ -94,7 +103,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	    static_cast<vk::SampleCountFlagBits>(info.samples)) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
-	return usage;
+	return AddFeedbackLoopUsage(graphics, usage);
 }
 
 void ValidateOptionalRange(GuestRange range, const char* name) {
@@ -699,7 +708,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             ImageMemoryPlacement placement)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
       m_graphics(graphics), m_scheduler(scheduler) {
@@ -724,10 +734,19 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	bool                    feedback_loop_usage =
+	    static_cast<bool>(create.usage & vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT);
+	auto format_supported = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         create.usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!format_supported() && feedback_loop_usage) {
+		create.usage &= ~vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+		feedback_loop_usage = false;
+	}
+	if (!format_supported()) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
@@ -735,11 +754,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (!graphics.CreateImage(create, backing, placement)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	this->feedback_loop_usage = feedback_loop_usage;
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,
 	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",

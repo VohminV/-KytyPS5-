@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -92,7 +93,11 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
-	GetGpuResources().MapMemory(vaddr, size);
+	if (Config::KeepGpuCacheOnReuseEnabled()) {
+		GetGpuResources().ResumeMemory(vaddr, size);
+	} else {
+		GetGpuResources().MapMemory(vaddr, size);
+	}
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -102,7 +107,11 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
-	GetGpuResources().UnmapMemory(vaddr, size);
+	if (Config::KeepGpuCacheOnReuseEnabled()) {
+		GetGpuResources().SuspendMemory(vaddr, size);
+	} else {
+		GetGpuResources().UnmapMemory(vaddr, size);
+	}
 }
 
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
@@ -1770,6 +1779,10 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 	EXIT_IF(removed != size || removed > m_allocated_total);
 	m_allocated = std::move(remaining);
 	m_allocated_total -= removed;
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->GetMemoryManager().InvalidateGuestBacking(
+		    vaddr, size, Libs::Graphics::GuestMemoryKind::Flexible);
+	}
 	return true;
 }
 
@@ -2140,6 +2153,10 @@ bool PooledMemory::Release(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 	m_mappings = std::move(kept);
 	for (const auto& mapping: released) {
 		AddFreeUnlocked(mapping.phys_addr, mapping.size);
+	}
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->GetMemoryManager().InvalidateGuestBacking(
+		    0, 0, Libs::Graphics::GuestMemoryKind::Pooled);
 	}
 	return true;
 }
@@ -2864,6 +2881,26 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool skip_gaps
 
 	for (const auto& alias: mapped_aliases) {
 		EXIT_IF(!g_virtual_ranges->Remove(alias.map_vaddr, alias.map_size));
+	}
+
+	if (g_gpu_resources != nullptr) {
+		bool pooled_invalidated = false;
+		for (const auto& block: allocated_span) {
+			// A retained GPU cache must not survive the physical range being
+			// handed to another allocation even if it lands at the same offset.
+			if (block.kind == PhysicalMemory::AllocationKind::Pooled) {
+				// Pooled backing is keyed by its first guest address rather than
+				// the physical offset, so any pool release invalidates the set.
+				if (!pooled_invalidated) {
+					g_gpu_resources->GetMemoryManager().InvalidateGuestBacking(
+					    0, 0, Libs::Graphics::GuestMemoryKind::Pooled);
+					pooled_invalidated = true;
+				}
+			} else {
+				g_gpu_resources->GetMemoryManager().InvalidateGuestBacking(block.start_addr,
+				                                                           block.size);
+			}
+		}
 	}
 
 	for (const auto& block: allocated_span) {
@@ -3595,6 +3632,39 @@ bool TestGuestFreeRangeBounds() {
 	       !GuestFreeRangeContains(UINT64_MAX - 0x1000, 0x2000, UINT64_MAX - 0x800, 0x400);
 }
 #endif
+
+bool GetGuestBackingInfo(uint64_t vaddr, uint64_t size, GuestBackingInfo& info) {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+
+	// VirtualRanges has its own lock. Do not take the global memory-operation
+	// mutex here: the GPU thread resolves backing while creating resources, and
+	// a kernel thread holding that mutex may be waiting for the GPU to drain.
+	VirtualRanges::Range candidate {};
+	if (!g_virtual_ranges->Query(vaddr, 0, &candidate) || vaddr < candidate.start ||
+	    vaddr >= candidate.start + candidate.size) {
+		return false;
+	}
+
+	const auto delta = vaddr - candidate.start;
+	info             = {};
+	info.start       = candidate.start;
+	info.size        = std::min(size, candidate.size - delta);
+	info.memory_type = candidate.memory_type;
+	info.is_direct   = (candidate.type == VirtualRangeType::Direct) ? 1u : 0u;
+	info.is_flexible = (candidate.type == VirtualRangeType::Flexible) ? 1u : 0u;
+	info.is_pooled   = IsPooledRangeType(candidate.type) ? 1u : 0u;
+	info.is_committed = IsCommittedRangeType(candidate.type) ? 1u : 0u;
+	// Direct ranges always carry their physical offset, including offset zero.
+	// Flexible/pooled ranges historically leave offset unset and are identified
+	// by the first guest address of the backing.
+	info.backing_offset = info.is_direct || candidate.offset != 0
+	                          ? candidate.offset + delta
+	                          : candidate.start + delta;
+	CopyVirtualRangeName(info.name, candidate.name);
+	return true;
+}
 
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {

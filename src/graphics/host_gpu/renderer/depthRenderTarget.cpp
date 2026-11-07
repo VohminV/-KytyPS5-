@@ -46,6 +46,7 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 	switch (static_cast<Prospero::StencilOp>(value)) {
 		case Prospero::StencilOp::kKeep: return vk::StencilOp::eKeep;
 		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
+		case Prospero::StencilOp::kOnes: return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kReplaceTest: return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kReplaceOp:
 			if ((op_value & write_mask) == 0) {
@@ -90,6 +91,9 @@ static vk::StencilOpState ConvertStencilState(
 		auto replacement = test_value;
 		if (static_cast<Prospero::StencilOp>(operations[i]) == Prospero::StencilOp::kReplaceOp) {
 			replacement = op_value;
+		}
+		if (static_cast<Prospero::StencilOp>(operations[i]) == Prospero::StencilOp::kOnes) {
+			replacement = 0xffu;
 		}
 		if (((reference ^ replacement) & required_bits & state.writeMask) != 0) {
 			DepthFatal("unsupported stencil replacement: compare=%u, compare mask=0x%02" PRIx32
