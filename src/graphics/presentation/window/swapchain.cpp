@@ -937,6 +937,15 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
+	// Use the format the resolved image actually has, not the requested one: the texture cache
+	// accepts format-compatible images with the opposite channel order, and CopyFrom is a raw
+	// copy with no conversion, so a mismatch would swap red and blue in the presented frame.
+	frame_format = image.backing.format;
+	switch (frame_format) {
+		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
+		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
+		default: break;
+	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
