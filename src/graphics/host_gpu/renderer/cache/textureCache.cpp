@@ -2180,7 +2180,7 @@ void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		if (m_slot_images[id].IsGpuModified()) {
-			(void)DownloadImageMemory(id);
+			(void)DownloadImageMemory(id, true);
 		}
 	}
 	m_download_images.clear();

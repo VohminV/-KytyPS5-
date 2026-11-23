@@ -244,13 +244,19 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	if (!m_has_pending_operations.load(std::memory_order_acquire)) {
+		return;
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
+				m_has_pending_operations.store(false, std::memory_order_release);
+				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
@@ -276,6 +282,9 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		if (!priority) {
+			m_has_pending_operations.store(true, std::memory_order_release);
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
