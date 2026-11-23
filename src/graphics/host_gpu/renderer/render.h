@@ -226,6 +226,13 @@ private:
 		uint32_t                resource = 0;
 	};
 	std::vector<WrittenBufferRange> m_written_buffer_ranges;
+	// ResolveRenderDepthTarget(): DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE is a persistent context
+	// register, but the clear it requests must happen once per request, not once per render-state
+	// change - otherwise the loadOp clear re-runs and wipes the depth written by earlier geometry
+	// in the same frame. Tracked per depth buffer address so a clear of one target does not
+	// suppress a clear of a different target bound later in the same frame.
+	bool     m_depth_clear_consumed      = false;
+	uint64_t m_depth_clear_consumed_addr = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 

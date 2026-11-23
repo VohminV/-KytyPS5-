@@ -272,6 +272,12 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
+	// The clear bit is edge-triggered in effect: release the bookkeeping when the guest lowers
+	// the register, and rearm again on the next raise.
+	if (!rc.depth_clear_enable) {
+		m_depth_clear_consumed      = false;
+		m_depth_clear_consumed_addr = 0;
+	}
 	if (!depth_active && !stencil_active) {
 		return;
 	}
@@ -314,7 +320,13 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		DepthFatal("unsupported depth-to-color copy state");
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
-	r.depth_clear_enable      = rc.depth_clear_enable;
+	const bool clear_already_consumed =
+	    m_depth_clear_consumed && m_depth_clear_consumed_addr == z.z_read_base_addr;
+	r.depth_clear_enable = rc.depth_clear_enable && !clear_already_consumed;
+	if (r.depth_clear_enable) {
+		m_depth_clear_consumed      = true;
+		m_depth_clear_consumed_addr = z.z_read_base_addr;
+	}
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = r.depth_test_enable && dc.z_write_enable &&
