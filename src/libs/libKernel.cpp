@@ -2208,6 +2208,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("dQHWEsJtoE4", Posix::pthread_mutexattr_init);
 	LIB_FUNC("mDmgMOGVUqg", Posix::pthread_mutexattr_settype);
 	LIB_FUNC("5txKfcMUAok", Posix::pthread_mutexattr_setprotocol);
+	LIB_FUNC("ZLvf6lVAc4M", Posix::pthread_mutexattr_setprioceiling);
 	LIB_FUNC("HF7lK46xzjY", Posix::pthread_mutexattr_destroy);
 	LIB_FUNC("ltCfaGr2JGE", Posix::pthread_mutex_destroy);
 	LIB_FUNC("mkx2fVhNMsg", Posix::pthread_cond_broadcast);

@@ -666,8 +666,13 @@ static void LogDrawBindings(const DrawRenderState&             state,
 	const auto* vs_module = state.vertex_info[0].stage.module;
 	const auto* ps_module = state.ps_input_info.stage.module;
 	std::fprintf(file, "DRAW %u frame=%u colors=%u idx=%u inst=%u first=%u"
+	                   " depth_test=%u depth_write=%u depth_func=%u depth_clear=%u"
 	                   " vs=%016" PRIx64 "/%016" PRIx64 " ps=%016" PRIx64 "/%016" PRIx64 "\n",
 	             draw++, frame, state.color_count, index_count, instance_count, first_instance,
+	             static_cast<uint32_t>(state.depth_info.depth_test_enable),
+	             static_cast<uint32_t>(state.depth_info.depth_write_enable),
+	             static_cast<uint32_t>(state.depth_info.depth_compare_op),
+	             static_cast<uint32_t>(state.depth_info.depth_clear_enable),
 	             vs_module != nullptr ? vs_module->id : 0,
 	             vs_module != nullptr ? vs_module->info.shader_hash : 0,
 	             ps_module != nullptr ? ps_module->id : 0,

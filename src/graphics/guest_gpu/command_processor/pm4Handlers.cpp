@@ -1859,7 +1859,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("skipping unknown indirect CX register 0x%04" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
+			}
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -1948,36 +1954,39 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
-		// Not sure if this is correct
-		// if (raw_cmd_offset != cmd_offset) {
-		// 	LOGF_COLOR(Log::Color::Red,
-		// 	           "\t temporary: normalized indirect UC register offset 0x%08" PRIx32
-		// 	           " -> 0x%08" PRIx32 "\n",
-		// 	           raw_cmd_offset, cmd_offset);
-		// }
+		if (raw_cmd_offset == 0xffffffffu) {
+			continue;
+		}
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("skipping indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
+				     ", regs=0x%016" PRIx64 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, indirect_address, value);
+			}
+			continue;
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
-				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("skipping unknown indirect UC register 0x%04" PRIx32
+				     " (raw 0x%08" PRIx32 "), value = 0x%08" PRIx32 "\n",
+				     cmd_offset, raw_cmd_offset, value);
 			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}
@@ -2295,6 +2304,23 @@ void GraphicsInitJmpTablesCxIndirect() {
 	for (auto& func: g_hw_ctx_indirect_func) {
 		func = nullptr;
 	}
+
+	for (auto cmd_offset = Pm4::COMPUTE_RELAUNCH; cmd_offset <= Pm4::COMPUTE_RELAUNCH2;
+	     cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			(void)cp;
+			(void)cmd_offset;
+			(void)value;
+		};
+	}
+
+	g_hw_ctx_indirect_func[0x2a] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("\t temporary: ignoring indirect CX reg 0x2a value = 0x%08" PRIx32 "\n",
+			     value);
+		}
+	};
 
 	for (auto cmd_offset = Pm4::SPI_PS_INPUT_CNTL_0; cmd_offset <= Pm4::SPI_PS_INPUT_CNTL_31;
 	     cmd_offset++) {
@@ -2699,6 +2725,10 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_POINT_MINMAX] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePointState(cmd_offset, value);
+	};
+
+	g_hw_ctx_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		HwCtxIgnoreFakeRegister(cmd_offset, value);
 	};
 
 	g_hw_ctx_indirect_func[Pm4::SPI_VS_OUT_CONFIG] = [](KYTY_HW_CTX_INDIRECT_ARGS) {

@@ -943,6 +943,10 @@ constexpr uint32_t COMPUTE_PGM_RSRC3          = 0x228;
 constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT = 0;
 constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK  = 0xF;
 constexpr uint32_t COMPUTE_PACE_ID             = 0x22A;
+constexpr uint32_t COMPUTE_RELAUNCH            = 0x22B;
+constexpr uint32_t COMPUTE_WAVE_RESTORE_ADDR_LO = 0x22C;
+constexpr uint32_t COMPUTE_WAVE_RESTORE_ADDR_HI = 0x22D;
+constexpr uint32_t COMPUTE_RELAUNCH2           = 0x22E;
 constexpr uint32_t COMPUTE_USER_DATA_0        = 0x240;
 constexpr uint32_t COMPUTE_USER_DATA_15       = 0x24F;
 

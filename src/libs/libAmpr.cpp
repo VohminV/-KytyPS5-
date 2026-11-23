@@ -4,6 +4,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "kernel/amprPacks.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -52,7 +53,9 @@ struct ResolvedPathInfo {
 	uint32_t    file_id   = 0xffffffffu;
 	uint64_t    file_size = 0;
 	bool        is_dir    = false;
+	bool        packed    = false;
 	std::filesystem::path host_path;
+	AmprPacks::FileInfo   packed_file;
 };
 
 static std::mutex                                        g_mutex;
@@ -61,6 +64,7 @@ static uint32_t                                          g_next_file_id       = 
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
 static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
+static std::unordered_map<uint32_t, AmprPacks::FileInfo>           g_packed_files;
 static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
 
@@ -121,6 +125,16 @@ static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	std::scoped_lock lock(g_mutex);
 	const auto       it = g_files.find(file_id);
 	if (it == g_files.end()) {
+		return false;
+	}
+	*out = it->second;
+	return true;
+}
+
+static bool TryGetPackedFile(uint32_t file_id, AmprPacks::FileInfo* out) {
+	std::scoped_lock lock(g_mutex);
+	const auto       it = g_packed_files.find(file_id);
+	if (it == g_packed_files.end()) {
 		return false;
 	}
 	*out = it->second;
@@ -214,7 +228,18 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		} else if (Common::File::IsFileExisting(real_path)) {
 			info.file_size = Common::File::Size(real_path);
 		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			AmprPacks::StatInfo packed_info {};
+			if (AmprPacks::Stat(path, &packed_info)) {
+				info.is_dir    = packed_info.is_dir;
+				info.file_size = packed_info.is_dir ? 0x10000 : packed_info.size;
+				if (!packed_info.is_dir && !AmprPacks::FindFile(path, &info.packed_file)) {
+					info.result = LibKernel::KERNEL_ERROR_ENOENT;
+				} else {
+					info.packed = !packed_info.is_dir;
+				}
+			} else {
+				info.result = LibKernel::KERNEL_ERROR_ENOENT;
+			}
 		}
 
 		bool log_missing = false;
@@ -229,14 +254,25 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
 				} else {
 					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
+					if (info.packed) {
+						g_packed_files.emplace(info.file_id, info.packed_file);
+					} else {
+						g_files.emplace(info.file_id, info.host_path);
+					}
 					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
 				}
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
 		}
-		if (!log_missing && info.result == OK && path.starts_with("/addcont")) {
+		if (!log_missing && info.result == OK && info.packed) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("\tAPR resolve packed: %s -> %s (%" PRIu64 " bytes)\n", guest_path,
+				     info.packed_file.path.c_str(), info.file_size);
+			}
+		}
+		if (!log_missing && info.result == OK && !info.packed && path.starts_with("/addcont")) {
 			LOGF("\tAPR resolve: %s -> %s (%" PRIu64 " bytes)\n", guest_path,
 			     Common::PathToString(info.host_path).c_str(), info.file_size);
 		}
@@ -425,9 +461,28 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 	}
 
 	std::filesystem::path host_path;
+	AmprPacks::FileInfo   packed_file {};
 	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
-		LOGF("\tAPR stat failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
+		if (!AprShared::TryGetPackedFile(file_id, &packed_file)) {
+			LOGF("\tAPR stat failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
+			return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
+		}
+		if (!AprShared::IsValidGuestRange(reinterpret_cast<uint64_t>(st), sizeof(*st), true)) {
+			return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
+		}
+
+		LibKernel::FileSystem::FileStat stat {};
+		stat.st_mode    = 0000777u | 0100000u;
+		stat.st_size    = static_cast<int64_t>(packed_file.size);
+		stat.st_blksize = 512;
+		stat.st_blocks  = (stat.st_size + 511) / 512;
+		const auto now  = Common::DateTime::FromSystemUTC();
+		stat.st_atim.tv_sec  = static_cast<int64_t>(now.ToUnix());
+		stat.st_mtim.tv_sec  = stat.st_atim.tv_sec;
+		stat.st_ctim.tv_sec  = stat.st_atim.tv_sec;
+		stat.st_birthtim.tv_sec = stat.st_atim.tv_sec;
+		*st = stat;
+		return KernelSyscallResult(OK);
 	}
 	if (!AprShared::IsValidGuestRange(reinterpret_cast<uint64_t>(st), sizeof(*st), true)) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
@@ -446,15 +501,24 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	std::filesystem::path host_path;
-	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
-		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
-	}
-
 	uint64_t cached_size = 0;
 	if (AprShared::TryGetHostFileSize(file_id, &cached_size)) {
 		*size = cached_size;
+		return OK;
+	}
+
+	std::filesystem::path host_path;
+	AmprPacks::FileInfo   packed_file {};
+	bool                  packed = false;
+	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
+		packed = AprShared::TryGetPackedFile(file_id, &packed_file);
+		if (!packed) {
+			LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
+			return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
+		}
+	}
+	if (packed) {
+		*size = packed_file.size;
 		return OK;
 	}
 
@@ -1183,10 +1247,26 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
+static int ReadPackedFileToGuest(const AmprPacks::FileInfo& file, uint64_t file_offset,
+                                 uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
 static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	if (const auto* payload = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
 		const auto& command = *payload;
+		AmprPacks::FileInfo packed_file {};
+		if (AprShared::TryGetPackedFile(command.file_id, &packed_file)) {
+			uint64_t bytes_read = 0;
+			const auto result   = ReadPackedFileToGuest(packed_file, command.file_offset,
+			                                            command.destination, command.size, &bytes_read);
+			if (result != OK) {
+				LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
+				     ", path=%s\n",
+				     command.file_id, static_cast<uint32_t>(result), packed_file.path.c_str());
+				return result;
+			}
+			return OK;
+		}
+
 		std::filesystem::path host_path;
 		if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
 			LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
@@ -1405,6 +1485,40 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	std::memset(reinterpret_cast<void*>(state.buffer + state.write_offset), 0,
 	            static_cast<size_t>(record_size));
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+}
+
+static int ReadPackedFileToGuest(const AmprPacks::FileInfo& file, uint64_t file_offset,
+                                 uint64_t destination, uint64_t size, uint64_t* bytes_read) {
+	if (bytes_read == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	*bytes_read = 0;
+	if (size == 0 || file_offset >= file.size) {
+		return OK;
+	}
+	if (!AprShared::IsValidGuestRange(destination, size, true)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	const auto readable = std::min<uint64_t>(size, file.size - file_offset);
+	uint64_t   got      = 0;
+	if (!AmprPacks::Read(file, file_offset, reinterpret_cast<void*>(destination), readable, &got)) {
+		return LibKernel::KERNEL_ERROR_EIO;
+	}
+	LibKernel::Memory::InvalidateMemory(destination, got);
+	static std::atomic<uint32_t> s_logged_reads {0};
+	const bool                   log_read = file.path.find("/shaders/") != std::string::npos ||
+	                                        s_logged_reads.fetch_add(1, std::memory_order_relaxed) < 64;
+	if (log_read) {
+		const auto* head = reinterpret_cast<const uint8_t*>(destination);
+		LOGF("\tAPR packed read: %s off=%" PRIu64 " size=%" PRIu64 " got=%" PRIu64
+		     " head=%02x%02x%02x%02x\n",
+		     file.path.c_str(), file_offset, readable, got, got > 0 ? head[0] : 0,
+		     got > 1 ? head[1] : 0, got > 2 ? head[2] : 0, got > 3 ? head[3] : 0);
+	}
+	*bytes_read = got;
+	return OK;
 }
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,

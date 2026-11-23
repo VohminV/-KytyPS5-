@@ -114,7 +114,7 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 
 	EXIT_NOT_IMPLEMENTED(parameters == nullptr);
 	EXIT_NOT_IMPLEMENTED(id == nullptr);
-	EXIT_NOT_IMPLEMENTED(parameters->size != 0x20);
+	EXIT_NOT_IMPLEMENTED(parameters->size != 0x20 && parameters->size != 0x28);
 
 	LOGF("\t user_id     = %d\n"
 	     "\t granularity = %u\n"

@@ -365,6 +365,7 @@ struct PthreadMutexattrPrivate {
 	pthread_mutexattr_t p;
 	int                 pprotocol;
 	int                 type;
+	int                 prioceiling = 0;
 };
 
 struct PthreadAttrPrivate {
@@ -1669,6 +1670,17 @@ int KYTY_SYSV_ABI PthreadMutexattrSetprotocol([[maybe_unused]] PthreadMutexattr*
 	}
 
 	return KERNEL_ERROR_EINVAL;
+}
+
+int KYTY_SYSV_ABI PthreadMutexattrSetprioceiling([[maybe_unused]] PthreadMutexattr* attr,
+                                                 int                                prioceiling) {
+	// PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(attr == nullptr || *attr == nullptr);
+
+	(*attr)->prioceiling = prioceiling;
+
+	return OK;
 }
 
 static int PthreadMutexInitNamed(PthreadMutex* mutex, const PthreadMutexattr* attr,
@@ -4445,6 +4457,13 @@ int KYTY_SYSV_ABI pthread_mutexattr_setprotocol(LibKernel::PthreadMutexattr* att
 	PRINT_NAME();
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadMutexattrSetprotocol(attr, protocol));
+}
+
+int KYTY_SYSV_ABI pthread_mutexattr_setprioceiling(LibKernel::PthreadMutexattr* attr,
+                                                   int                          prioceiling) {
+	PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadMutexattrSetprioceiling(attr, prioceiling));
 }
 
 int KYTY_SYSV_ABI pthread_mutexattr_destroy(LibKernel::PthreadMutexattr* attr) {

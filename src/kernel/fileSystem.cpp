@@ -1,5 +1,7 @@
 #include "kernel/fileSystem.h"
 
+#include "kernel/amprPacks.h"
+
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -77,6 +79,9 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	bool                                packed;
+	AmprPacks::FileInfo                 packed_file;
+	uint64_t                            packed_pos;
 };
 
 class FileDescriptors {
@@ -159,6 +164,21 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 	return dirents;
 }
 
+static std::vector<Common::File::DirEntry> GetDirectoryEntries(
+    const std::string& guest_path, const std::filesystem::path& real_path) {
+	auto entries = real_path.empty() ? std::vector<Common::File::DirEntry> {}
+	                                : Common::File::GetDirEntries(real_path);
+	for (const auto& packed: AmprPacks::ListDirectory(guest_path)) {
+		const auto it = std::find_if(entries.begin(), entries.end(), [&packed](const auto& entry) {
+			return Common::EqualNoCase(entry.name, packed.name);
+		});
+		if (it == entries.end()) {
+			entries.push_back(packed);
+		}
+	}
+	return entries;
+}
+
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	const auto remaining =
 	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
@@ -186,6 +206,8 @@ int FileDescriptors::CreateDescriptor() {
 	file->append      = false;
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
+	file->packed      = false;
+	file->packed_pos  = 0;
 
 	int files_num = static_cast<int>(m_files.size());
 	for (int index = 0; index < files_num; index++) {
@@ -482,9 +504,24 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
-	if (file->real_name.empty()) {
+
+	AmprPacks::StatInfo packed_info {};
+	bool                packed_path = false;
+	if (file->real_name.empty() ||
+	    (!Common::File::IsFileExisting(file->real_name) &&
+	     !Common::File::IsDirectoryExisting(file->real_name))) {
+		packed_path = AmprPacks::Stat(file->name, &packed_info);
+	}
+	if (file->real_name.empty() && !packed_path) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
+	}
+	if (packed_path) {
+		file->real_name = file->name;
+		if (rw_mode != Common::File::Mode::Read || trunc || creat || excl) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EROFS;
+		}
 	}
 	if (Common::IsArchivePath(file->real_name) &&
 	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
@@ -497,12 +534,15 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_EACCES;
 	}
 
-	const auto info = Common::File::GetInfo(file->real_name);
-	const bool dir_exist = info && !info->is_file;
-	const bool file_exist = info && info->is_file;
+	std::optional<Common::File::Info> info;
+	if (!packed_path) {
+		info = Common::File::GetInfo(file->real_name);
+	}
+	const bool dir_exist  = packed_path ? packed_info.is_dir : (info && !info->is_file);
+	const bool file_exist = !packed_path && info && info->is_file;
 
 	// A missing path opened without O_CREAT is ENOENT
-	if (!creat && !dir_exist && !file_exist) {
+	if (!packed_path && !creat && !dir_exist && !file_exist) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
 	}
@@ -516,7 +556,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
 		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
 
-		const auto entries = Common::File::GetDirEntries(file->real_name);
+		const auto entries = GetDirectoryEntries(file->name, packed_path ? std::filesystem::path {} : file->real_name);
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
@@ -528,6 +568,20 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		for (const auto& f: entries) {
 			LOGF("\t\t%s %s\n", f.is_file ? "[file]" : "[dir ]", f.name.c_str());
 		}
+	} else if (packed_path) {
+		AmprPacks::FileInfo packed_file {};
+		if (!AmprPacks::FindFile(file->name, &packed_file)) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOENT;
+		}
+		file->packed      = true;
+		file->packed_file = std::move(packed_file);
+		file->opened      = true;
+
+		LOGF_COLOR(Log::Color::Green, "\tOpen packed: %s, %" PRIu64 " bytes, [ok]\n",
+		           Common::PathToString(file->real_name).c_str(), file->packed_file.size);
+
+		return descriptor;
 	} else {
 		bool result = false;
 
@@ -587,7 +641,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	EXIT_IF(!file->opened);
 
-	if (!file->directory && file->special == SpecialFile::None) {
+	if (!file->directory && file->special == SpecialFile::None && !file->packed) {
 		file->f.Close();
 	}
 
@@ -663,6 +717,21 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		     Common::PathToString(file->real_name).c_str());
 
 		return static_cast<int64_t>(nbytes);
+	}
+
+	if (file->packed) {
+		Common::LockGuard lock(file->mutex);
+		uint64_t           bytes_read = 0;
+		if (!AmprPacks::Read(file->packed_file, file->packed_pos, buf, nbytes, &bytes_read)) {
+			return KERNEL_ERROR_EIO;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes_read);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes,
+		                           static_cast<uint32_t>(bytes_read));
+		file->packed_pos += bytes_read;
+		LOGF("\tRead %" PRIu64 " packed bytes from: %s\n", bytes_read,
+		     Common::PathToString(file->real_name).c_str());
+		return static_cast<int64_t>(bytes_read);
 	}
 
 	file->mutex.Lock();
@@ -791,6 +860,21 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	if (file->packed) {
+		Common::LockGuard lock(file->mutex);
+		uint64_t           bytes_read = 0;
+		if (!AmprPacks::Read(file->packed_file, static_cast<uint64_t>(offset), buf, nbytes,
+		                     &bytes_read)) {
+			return KERNEL_ERROR_EIO;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), bytes_read);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes,
+		                           static_cast<uint32_t>(bytes_read));
+		LOGF("\tRead %" PRIu64 " packed bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
+		     Common::PathToString(file->real_name).c_str());
+		return static_cast<int64_t>(bytes_read);
+	}
+
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
@@ -882,6 +966,31 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 			}
 		}
 		return static_cast<int64_t>(total);
+	}
+	if (file->packed) {
+		uint64_t position  = static_cast<uint64_t>(offset);
+		int64_t  bytes_read = 0;
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len == 0) {
+				continue;
+			}
+			uint64_t bytes = 0;
+			if (!AmprPacks::Read(file->packed_file, position, buffer.iov_base, buffer.iov_len,
+			                     &bytes)) {
+				return KERNEL_ERROR_EIO;
+			}
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), bytes);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes,
+			                           static_cast<uint32_t>(bytes));
+			position += bytes;
+			bytes_read += static_cast<int64_t>(bytes);
+			if (bytes < buffer.iov_len) {
+				break;
+			}
+		}
+		LOGF("\tReadv %" PRId64 " packed bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n",
+		     bytes_read, offset, iovcnt, Common::PathToString(file->real_name).c_str());
+		return bytes_read;
 	}
 	if (file->f.IsInvalid()) {
 		return KERNEL_ERROR_EIO;
@@ -1075,7 +1184,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	Common::LockGuard lock(file->mutex);
 
-	if (!file->directory && file->f.IsInvalid()) {
+	if (!file->directory && !file->packed && file->f.IsInvalid()) {
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
 	}
@@ -1083,8 +1192,14 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	uint64_t base = 0;
 	switch (whence) {
 		case 0: break;
-		case 1: base = file->directory ? file->dents_offset : file->f.Tell(); break;
-		case 2: base = file->directory ? file->dirents.size() : file->f.Size(); break;
+		case 1:
+			base = file->directory ? file->dents_offset
+			                       : (file->packed ? file->packed_pos : file->f.Tell());
+			break;
+		case 2:
+			base = file->directory ? file->dirents.size()
+			                       : (file->packed ? file->packed_file.size : file->f.Size());
+			break;
 		default: return KERNEL_ERROR_EINVAL;
 	}
 
@@ -1107,6 +1222,8 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	if (file->directory) {
 		file->dents_offset = position;
+	} else if (file->packed) {
+		file->packed_pos = position;
 	} else {
 		file->f.Seek(position);
 		EXIT_IF(file->f.Tell() != position);
@@ -1129,13 +1246,18 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
-	const auto info = Common::File::GetInfo(real_file_name);
-	if (!info) {
+	std::optional<Common::File::Info> info;
+	if (!real_file_name.empty()) {
+		info = Common::File::GetInfo(real_file_name);
+	}
+	AmprPacks::StatInfo packed_info {};
+	const bool          packed_path = !info && AmprPacks::Stat(path, &packed_info);
+	if (!info && !packed_path) {
 		LOGF("\t file not found\n");
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	const bool is_dir = !info->is_file;
+	const bool is_dir = packed_path ? packed_info.is_dir : !info->is_file;
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
@@ -1144,16 +1266,19 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	auto wt = at;
 
 	if (is_dir) {
-		stat.st_size =
-		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
+		const auto entries = GetDirectoryEntries(
+		    path, packed_path ? std::filesystem::path {} : real_file_name);
+		stat.st_size    = static_cast<int64_t>(PackDirents(entries).size());
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
+		stat.st_size    = static_cast<int64_t>(packed_path ? packed_info.size : info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
-		Common::File::GetLastAccessAndWriteTimeUTC(real_file_name, &at, &wt);
+		if (!packed_path) {
+			Common::File::GetLastAccessAndWriteTimeUTC(real_file_name, &at, &wt);
+		}
 	}
 
 	SecToTimespec(&stat.st_atim, at.ToUnix());
@@ -1197,6 +1322,10 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 		stat.st_size    = 0;
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
+	} else if (file->packed) {
+		stat.st_size    = static_cast<int64_t>(file->packed_file.size);
+		stat.st_blksize = 512;
+		stat.st_blocks  = (stat.st_size + 511) / 512;
 	} else if (!file->directory) {
 		file->mutex.Lock();
 
@@ -1553,6 +1682,11 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	auto real_name = g_mount_points->ResolvePath(mounted_path);
 
 	if (Common::File::IsFileExisting(real_name) || Common::File::IsDirectoryExisting(real_name)) {
+		return OK;
+	}
+
+	AmprPacks::StatInfo packed_info {};
+	if (AmprPacks::Stat(mounted_path, &packed_info)) {
 		return OK;
 	}
 

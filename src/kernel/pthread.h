@@ -81,6 +81,7 @@ int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrDestroy(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrSettype(PthreadMutexattr* attr, int type);
 int KYTY_SYSV_ABI PthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol);
+int KYTY_SYSV_ABI PthreadMutexattrSetprioceiling(PthreadMutexattr* attr, int prioceiling);
 int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr,
                                    const char* name);
 int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex);
@@ -286,6 +287,8 @@ int KYTY_SYSV_ABI   pthread_mutex_init(LibKernel::PthreadMutex*           mutex,
 int KYTY_SYSV_ABI   pthread_mutexattr_init(LibKernel::PthreadMutexattr* attr);
 int KYTY_SYSV_ABI   pthread_mutexattr_settype(LibKernel::PthreadMutexattr* attr, int type);
 int KYTY_SYSV_ABI   pthread_mutexattr_setprotocol(LibKernel::PthreadMutexattr* attr, int protocol);
+int KYTY_SYSV_ABI   pthread_mutexattr_setprioceiling(LibKernel::PthreadMutexattr* attr,
+                                                     int                          prioceiling);
 int KYTY_SYSV_ABI   pthread_mutexattr_destroy(LibKernel::PthreadMutexattr* attr);
 int KYTY_SYSV_ABI   pthread_getstack(const LibKernel::PthreadAttr* __restrict attr,
                                      void** __restrict stack_addr, size_t* __restrict stack_size);

@@ -607,6 +607,12 @@ struct MsgDialogParam {
 	uint32_t pad1;
 };
 
+struct MsgDialogUserMessageParam {
+	int32_t     button_type;
+	uint32_t    pad;
+	const char* msg;
+};
+
 struct MsgDialogResult {
 	int32_t mode;
 	int32_t result;
@@ -641,6 +647,19 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     p->size, p->mode, reinterpret_cast<uint64_t>(p->user_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
+
+		const auto* user_msg = static_cast<const MsgDialogUserMessageParam*>(p->user_msg_param);
+		if (user_msg != nullptr) {
+			LOGF("\t user msg raw   = %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+			     " %016" PRIx64 "\n",
+			     reinterpret_cast<const uint64_t*>(user_msg)[0],
+			     reinterpret_cast<const uint64_t*>(user_msg)[1],
+			     reinterpret_cast<const uint64_t*>(user_msg)[2],
+			     reinterpret_cast<const uint64_t*>(user_msg)[3]);
+			if (user_msg->msg != nullptr) {
+				LOGF("\t user message   = %s\n", user_msg->msg);
+			}
+		}
 	}
 
 	g_status = STATUS_FINISHED;
